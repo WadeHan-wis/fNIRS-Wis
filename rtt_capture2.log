@@ -1,0 +1,30 @@
+*** Booting nRF Connect SDK v3.4.0-99553055607b ***
+*** Using Zephyr OS v4.4.0-bf801e4e3d19 ***
+[00:00:00.000,610] [0m<inf> app_main: ==============================[0m
+[00:00:00.000,610] [0m<inf> app_main:   fNIRS FW (Rev0 scaffold)[0m
+[00:00:00.000,610] [0m<inf> app_main:   Zephyr RTOS scheduler started.[0m
+[00:00:00.000,640] [0m<inf> app_main: ==============================[0m
+[00:00:00.000,671] [1;31m<err> os: ***** MPU FAULT *****[0m
+[00:00:00.000,701] [1;31m<err> os:   Data Access Violation[0m
+[00:00:00.000,701] [1;31m<err> os:   MMFAR Address: 0x50a[0m
+[00:00:00.000,732] [1;31m<err> os: r0/a1:  0x00000000  r1/a2:  0x00000000  r2/a3:  0x00000000[0m
+[00:00:00.000,732] [1;31m<err> os: r3/a4:  0x00000002 r12/ip:  0x00000008 r14/lr:  0x00012e0b[0m
+[00:00:00.000,732] [1;31m<err> os:  xpsr:  0x01000000[0m
+[00:00:00.000,762] [1;31m<err> os: Faulting instruction address (r15/pc): 0x00012e0e[0m
+[00:00:00.000,793] [1;31m<err> os: >>> ZEPHYR FATAL ERROR 19: Unknown error on os: >>> ZEPHYR FATAL ERROR 19: Unknown error on os: r0/a1:  0x00000000  r1/a2:  0x00000000  r2/a3:  0x00000000[0m
+[00:00:00.000,732] [1;31m<err> os: r3/a4:  0x00000002 r12/ip:  0x00000008 r14/lr:  0x00012e0b[0m
+os: >>> ZEPHYR FATAL ERROR 19: Unknown error on os: Current thread: 0x200005f8 (unknown)[0m
+*** Booting nRF Connect SDK v3.4.0-99553055607b ***
+*** Using Zephyr OS v4.4.0-bf801e4e3d19 ***
+[00:00:00.000,610] [0m<inf> app_main: ==============================[0m
+[00:00:00.000,610] [0m<inf> app_main:   fNIRS FW (Rev0 scaffold)[0m
+[00:00:00.000,610] [0m<inf> app_main:   Zephyr RTOS scheduler started.[0m
+[00:00:00.000,640] [0m<inf> app_main: ==============================[0m
+[00:00:00.100,738] [1;31m<err> os: Unhandled IRQn: 36[0m
+[00:00:00.100,769] [1;31m<err> os: >>> ZEPHYR FATAL ERROR 1: Unhandled interrupt on CPU 0[0m
+[00:00:00.100,799] [1;31m<err> os: Current thread: 0x20000c68 (unknown)[0m
+[00:00:00.401,733] [1;31m<err> os: Halting system[0m
+[00:00:00.100,738] [1;31m<err> [00:00:00.253,143] [1;31m<err> os: Halting system[0m
+[00:00:00.100,70os: >>> ZEPHYR FATAL ERROR 1: Unhandled interrupt on CPU 0[0m
+[00:00:00.100,769] [1;31m<err> os: Current thread: 0x20000c68 (unknown)[0m
+[00:00:00.100,708] [1;31m<err> os: Unhandled IR

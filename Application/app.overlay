@@ -1,0 +1,64 @@
+/*
+ * PoC v1 보드(nRF52832-QFAA-R) 전용 devicetree overlay.
+ * 근거: pinmap.md §3 — P0.09/P0.10이 NIR1 I2C(SCL/SDA)로 실장되어 있어
+ * NFC 안테나 전용 핀 기본값을 포기하고 GPIO로 전환해야 한다.
+ *
+ * 이 NCS 버전(Zephyr 4.4)은 CONFIG_NFCT_PINS_AS_GPIOS Kconfig가 폐지되었고
+ * 대신 UICR devicetree 프로퍼티로 설정한다 (zephyr migration-guide-3.5.rst 참고).
+ */
+#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
+#include <zephyr/dt-bindings/pwm/pwm.h>
+
+&uicr {
+	nfct-pins-as-gpios;
+};
+
+/*
+ * LED PWM (pinmap.md §2): LED1(640nm)=P0.04, LED2(680nm)=P0.05, LED3(PoC v1
+ * 실장 980nm, 스펙 950nm)=P0.06. 전부 PWM0의 채널 0/1/2로 묶는다.
+ * NPN 트랜지스터 베이스 직결(R17~R20=0Ω) 구조라 GPIO High = LED ON (active-high,
+ * nordic,invert 불필요) — pinmap.md §2 회로 그대로.
+ */
+&pinctrl {
+	pwm0_default: pwm0_default {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 0, 4)>,
+				<NRF_PSEL(PWM_OUT1, 0, 5)>,
+				<NRF_PSEL(PWM_OUT2, 0, 6)>;
+			/* nrf52dk_nrf52832-pinctrl.dtsi의 원래 pwm0_default(핀17, 온보드 LED)에는
+			 * nordic,invert가 있다 — 우리 회로는 active-high라 반드시 제거해야 한다.
+			 * (2026-09-14: 실기 검증 중 채널0만 반전되는 걸 발견해 추가.)
+			 */
+			/delete-property/ nordic,invert;
+		};
+	};
+
+	pwm0_sleep: pwm0_sleep {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 0, 4)>,
+				<NRF_PSEL(PWM_OUT1, 0, 5)>,
+				<NRF_PSEL(PWM_OUT2, 0, 6)>;
+			low-power-enable;
+		};
+	};
+};
+
+&pwm0 {
+	status = "okay";
+	pinctrl-0 = <&pwm0_default>;
+	pinctrl-1 = <&pwm0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+/* m_i2c_led.c가 PWM_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), N)으로 참조한다.
+ * 인덱스 순서는 config_app.h의 nirs_wavelength_t(640/680/950nm) 순서와 일치해야 한다.
+ * TODO(open-item): PWM 주파수(현재 1kHz, 1ms 주기)는 임시값 — Rev1 AS7341 실측 시
+ * integration time과의 상호작용을 보고 재조정한다.
+ */
+/ {
+	zephyr,user {
+		pwms = <&pwm0 0 PWM_USEC(1000) PWM_POLARITY_NORMAL>,
+		       <&pwm0 1 PWM_USEC(1000) PWM_POLARITY_NORMAL>,
+		       <&pwm0 2 PWM_USEC(1000) PWM_POLARITY_NORMAL>;
+	};
+};

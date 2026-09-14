@@ -1,0 +1,5 @@
+r
+SetBP 0x0000fd48
+g
+regs
+q

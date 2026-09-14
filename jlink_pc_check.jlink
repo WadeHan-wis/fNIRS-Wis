@@ -1,0 +1,8 @@
+halt
+regs
+go
+sleep 500
+halt
+regs
+go
+q
