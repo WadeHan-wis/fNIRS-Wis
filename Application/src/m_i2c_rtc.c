@@ -51,13 +51,16 @@ static uint16_t next_cc_delta(void)
 {
 	uint16_t delta;
 
-	/* 5프레임 중 1회만 HIGH(3277), 나머지 4회는 LOW(3276)
-	 * 합계 = 3276*4 + 3277 = 13381 tick = 정확히 500ms (LFCLK 32.768kHz 기준)
+	/* 100ms의 정확한 tick 수는 32768/10 = 3276.8 — 소수부 0.8이므로 5프레임 중
+	 * 80%(4회)는 올림(3277), 20%(1회)는 버림(3276)이어야 평균이 정확히 3276.8이 된다.
+	 * 합계 = 4*3277 + 3276 = 16384 tick = 정확히 500ms(32768Hz의 절반).
+	 * (2026-09-15 코드 리뷰로 발견/수정: 이전엔 이 비율이 반대(1×HIGH+4×LOW=16381,
+	 * 500ms보다 3 tick=91.55us 부족 → 약 183ppm 만큼 시간이 빠르게 누적되는 버그였음)
 	 */
 	if (s_bresenham_frame_index == 0) {
-		delta = RTC_TICK_TARGET_100MS_HIGH;
-	} else {
 		delta = RTC_TICK_TARGET_100MS_LOW;
+	} else {
+		delta = RTC_TICK_TARGET_100MS_HIGH;
 	}
 
 	s_bresenham_frame_index++;

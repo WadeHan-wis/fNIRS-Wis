@@ -220,8 +220,22 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
 2. 생산검사(production test) 모드 구조
 3. 규제 관점 추가 안전/신뢰성 요구사항
 4. 논문 내 모순 2건(sleep threshold 방향성, spectral band 서술) — 저자 코드/공개자료 확인 전까지 펌웨어/서버 어느 쪽에도 구현하지 않음
+5. **AS7341 gain(AGAIN)/integration time(ATIME/ASTEP) 실측 캘리브레이션 및 SMUX 채널 매핑(F5~F8+Clear+NIR) 바이트 단위 교차검증**
+   — 참고문헌: Ban et al., *Sci. Adv.* 12, eaed2056 (2026) "A soft wearable near-infrared
+   spectroscopy system for detecting brain water dynamics linked to glymphatic activity
+   during sleep" (`docs/nirs_thesis.pdf`). 이 논문은 640/680/950nm LED(680nm=OIS-330 IE680,
+   950nm=MTE9730CP) + AS7341 포토디텍터 + **source-detector 30mm** + **10Hz 샘플링**으로 우리
+   구조와 시스템 레벨 파라미터가 거의 동일하나, AS7341 레지스터 수준(gain/ATIME 등) 설정값은
+   논문에 없다(과학 논문 특성상 당연히 로우레벨 firmware 설정은 미기재). 신호처리는 modified
+   Beer-Lambert law(HbO/HbR/H2O extinction matrix + DPF 보정)를 사용하며, 이는 향후 Rev1
+   신호처리 단계의 알고리즘 참고 대상이다.
+   **검증 방식(2026-09-15 결정)**: 지금 펌웨어 단으로 정성적 광응답만 확인된 상태(v0.0.5,
+   CHANGELOG 참고)이고, 정량 캘리브레이션은 **모바일 앱과 연동해서 raw data를 실제로 수집한
+   뒤에 진행**하기로 함 — 필요 시 위 논문 저자(교신저자 W.-H. Yeo/C.-H. Yun)에게 직접 문의 가능한
+   경로가 있음. 이 항목이 해소되기 전까지 gain=9(256x)/ATIME=29(약 83ms)는 "동작 확인" 수준의
+   임시값으로 취급한다.
 
-이 4개 항목이 해소되기 전까지 본 문서는 정식 승인 문서로 간주하지 않는다.
+이 5개 항목이 해소되기 전까지 본 문서는 정식 승인 문서로 간주하지 않는다.
 
 ### 다음 보드 리비전 반영 예정 (하드웨어 개선 항목, 확정됨 — 일정만 대기)
 - **LED3 파장 부품 교체**: 스펙(§0/§5/§9)은 950nm이나, PoC v1 보드(`SCH_fNIRS_Sleep_Project.pdf`) 실장 부품은

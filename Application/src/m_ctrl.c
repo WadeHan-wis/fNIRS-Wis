@@ -1,3 +1,4 @@
+#include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
 #include "m_ctrl.h"
@@ -20,6 +21,12 @@ static ctrl_reset_reason_t s_last_reset_reason;
  * 재연결/해제는 Rev2 범위)라 별도 mutex 없이 volatile bool로 충분하다.
  */
 static volatile bool g_ble_connected;
+
+/* AS7341_CONFIG 중계용 (m_ble → m_ctrl → m_i2c). 다중 바이트라 mutex로 보호한다
+ * (BLE Task가 쓰고 I2C Task가 tick마다 읽는 cross-task 공유 데이터). */
+K_MUTEX_DEFINE(mtx_as7341_config);
+static uint8_t s_as7341_config[CTRL_AS7341_CONFIG_LEN];
+static bool s_as7341_config_pending;
 
 void m_ctrl_report_error(module_err_t err)
 {
@@ -51,6 +58,29 @@ void m_ctrl_notify_ble_connected(void)
 bool m_ctrl_is_ble_connected(void)
 {
 	return g_ble_connected;
+}
+
+void m_ctrl_notify_as7341_config(const uint8_t config[CTRL_AS7341_CONFIG_LEN])
+{
+	k_mutex_lock(&mtx_as7341_config, K_FOREVER);
+	memcpy(s_as7341_config, config, CTRL_AS7341_CONFIG_LEN);
+	s_as7341_config_pending = true;
+	k_mutex_unlock(&mtx_as7341_config);
+}
+
+bool m_ctrl_take_as7341_config(uint8_t out[CTRL_AS7341_CONFIG_LEN])
+{
+	bool had_pending;
+
+	k_mutex_lock(&mtx_as7341_config, K_FOREVER);
+	had_pending = s_as7341_config_pending;
+	if (had_pending) {
+		memcpy(out, s_as7341_config, CTRL_AS7341_CONFIG_LEN);
+		s_as7341_config_pending = false;
+	}
+	k_mutex_unlock(&mtx_as7341_config);
+
+	return had_pending;
 }
 
 static void handle_error(module_err_t err)

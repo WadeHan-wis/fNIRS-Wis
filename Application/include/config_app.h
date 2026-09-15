@@ -16,7 +16,7 @@ extern "C" {
  */
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 0
-#define FW_VERSION_PATCH 1
+#define FW_VERSION_PATCH 10
 
 /* nirs_sample_t.fw_version(uint16_t)에 담기 위한 패킹: MAJOR(4bit)|MINOR(4bit)|PATCH(8bit) */
 #define FW_VERSION_PACKED \
@@ -38,7 +38,8 @@ extern "C" {
 
 /* --- Sampling / RTC timing (architecture.md §2.3) ---
  * LFCLK 32.768kHz 기준 100ms = 3276.8 tick (비정수).
- * 5-frame 주기로 3277 tick 1회 + 3276 tick 4회 = 정확히 500ms.
+ * 5-frame 주기로 3277 tick 4회 + 3276 tick 1회 = 16384 tick = 정확히 500ms
+ * (2026-09-15 코드 리뷰로 비율이 반대로 구현돼 있던 버그 발견/수정, m_i2c_rtc.c 참고).
  */
 #define RTC_LFCLK_HZ                 32768
 #define RTC_TICK_TARGET_100MS_LOW    3276
@@ -55,6 +56,13 @@ typedef enum {
 	NIRS_WAVELENGTH_COUNT,
 } nirs_wavelength_t;
 
+/* --- NIR 센서 (AS7341 x2, pinmap.md §3: 각각 독립 I2C 버스) --- */
+typedef enum {
+	NIR_SENSOR_1 = 0, /* &i2c1, SCL=P0.09/SDA=P0.10 */
+	NIR_SENSOR_2,      /* &i2c0, SCL=P0.08/SDA=P0.07 */
+	NIR_SENSOR_COUNT,
+} nir_sensor_id_t;
+
 /* --- Ring buffer (architecture.md §2.5: 100~200 샘플) --- */
 #define RING_BUFFER_CAPACITY 150
 
@@ -68,7 +76,7 @@ typedef enum {
  * BLE 연동 성공 시 10회 점멸 → 측정 시퀀스(파장별 PWM 스트로빙,
  * m_i2c_task_entry의 acquire_one_sample) 시작.
  */
-#define I2C_LED_INDICATOR_DUTY_PERMILLE 500 /* 50% duty — 디버깅 중 눈부심 방지 (2026-09-14 변경, 기존 80) */
+#define I2C_LED_INDICATOR_DUTY_PERMILLE 200 /* 20% duty — 개발 단계 눈부심 방지 (2026-09-15 변경, 기존 50) */
 
 /* 디바이스 On 상태에서 LED 1개당 점등 유지 시간. RTC 100ms tick을 그대로 세므로
  * SAMPLE_RATE_HZ(10)개 tick = 1초.
@@ -85,6 +93,19 @@ typedef enum {
  * (토글 1회=100ms, 점멸 1회=on+off=2 tick=200ms → 10회 점멸 = 2초).
  */
 #define I2C_LED_BLE_CONNECT_BLINK_COUNT 10
+
+/* TEMP(개발용, 2026-09-15): AS7341 채널-파장 매핑 실측 검증용. 1이면 BLE 연동 대기 없이
+ * 부팅 즉시 측정 시퀀스(acquisition)로 진입해서 raw 채널 값을 RTT로 바로 확인할 수 있다.
+ * 실제 BLE(Rev2)가 준비되기 전까지의 임시 우회이며, 검증 끝나면 0으로 되돌린다.
+ */
+#define TEMP_AS7341_READ_TEST 0
+
+/* TEMP(개발용, 2026-09-15): RTC 100ms ISR → I2C Task wake 주기 실측 검증용.
+ * 1이면 세마포어로 깨어날 때마다 RTC 타임스탬프를 로그로 찍어 tick 간격이 실제로
+ * ~100ms인지 확인할 수 있다. 트래커 "Zephyr Task RTC Timer로 100ms ISR 구현" 항목의
+ * 검증 방식(ISR 디버깅 로그 확인)에 대응. 검증 끝나면 0으로 되돌린다.
+ */
+#define TEMP_RTC_TICK_LOG_TEST 0
 
 #ifdef __cplusplus
 }

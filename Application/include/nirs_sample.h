@@ -17,10 +17,12 @@ typedef struct {
 	uint32_t timestamp_us;     /* S2 관례: 32bit us 단위 */
 	uint32_t seq_num;          /* monotonic sequence number, 누락 검출용 */
 
-	uint16_t raw[NIRS_WAVELENGTH_COUNT]; /* 640/680/950nm raw intensity */
+	/* raw[NIR_SENSOR_1/2][640/680/950nm] — 보드에 AS7341이 2개(pinmap.md §3, 각각
+	 * 독립 I2C) 실장돼 있어 센서별로 raw intensity를 분리 보존한다. */
+	uint16_t raw[NIR_SENSOR_COUNT][NIRS_WAVELENGTH_COUNT];
 
-	uint16_t gain;             /* AS7341 gain 설정값 */
-	uint16_t integration_time; /* AS7341 integration time 설정값 */
+	uint16_t gain;             /* AS7341 gain 설정값 (NIR1/NIR2 공용 고정값) */
+	uint16_t integration_time; /* AS7341 integration time 설정값 (NIR1/NIR2 공용 고정값) */
 	uint16_t led_duty[NIRS_WAVELENGTH_COUNT]; /* LED PWM duty (파장별) */
 
 	uint8_t battery_pct;       /* TODO(open-item): Battery 모듈 미구현 — 현재 0 고정 */

@@ -9,6 +9,7 @@
 #define M_CTRL_H_
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "module_err.h"
 
 #ifdef __cplusplus
@@ -53,6 +54,20 @@ ctrl_state_t m_ctrl_get_state(void);
  */
 void m_ctrl_notify_ble_connected(void);
 bool m_ctrl_is_ble_connected(void);
+
+/* AS7341_CONFIG(0x1525) write 중계 (m_ble → m_ctrl → m_i2c), 위와 동일한 이유로
+ * CTRL을 거친다. 바이트 포맷 자체는 이 모듈이 해석하지 않는다(불투명 10바이트) —
+ * 인코드/디코드는 m_ble_proto(수신 시)와 m_i2c(적용 시) 양쪽이 테스트 APK 프로토콜
+ * 스펙을 각자 알고 처리한다 (2026-09-15, 사용자 제공 APK 리버싱 결과 반영).
+ * m_ctrl_notify_as7341_config()는 여러 태스크에서 호출될 수 있어 mutex로 보호한다.
+ */
+#define CTRL_AS7341_CONFIG_LEN 10
+
+void m_ctrl_notify_as7341_config(const uint8_t config[CTRL_AS7341_CONFIG_LEN]);
+
+/* out에 최신 설정을 복사하고 true 반환 — 새 설정이 이전에 소비된 뒤 다시 갱신되지
+ * 않았으면 false (m_i2c가 매 tick 이걸 확인해서 "새 설정이 있을 때만" 적용한다). */
+bool m_ctrl_take_as7341_config(uint8_t out[CTRL_AS7341_CONFIG_LEN]);
 
 #ifdef __cplusplus
 }

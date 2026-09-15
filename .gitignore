@@ -1,1 +1,4 @@
 build*/
+/_ref_fnirs_example
+*.jlink
+*.log

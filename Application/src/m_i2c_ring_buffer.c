@@ -28,10 +28,13 @@ module_err_t m_i2c_ring_buffer_push(const nirs_sample_t *sample)
 		return MODULE_ERR_INVALID_PARAM;
 	}
 
+	bool overflowed = false;
+
 	k_mutex_lock(&mtx_ring_buffer, K_FOREVER);
 
 	if (s_count >= RING_BUFFER_CAPACITY) {
 		/* overflow: silent loss 금지 — counter만 증가시키고 가장 오래된 샘플을 덮어쓴다 */
+		overflowed = true;
 		g_dropped_sample_count++;
 		s_tail = (s_tail + 1) % RING_BUFFER_CAPACITY;
 		s_count--;
@@ -47,7 +50,7 @@ module_err_t m_i2c_ring_buffer_push(const nirs_sample_t *sample)
 
 	k_mutex_unlock(&mtx_ring_buffer);
 
-	return (g_dropped_sample_count > 0) ? MODULE_ERR_RING_BUFFER_OVERFLOW : MODULE_ERR_OK;
+	return overflowed ? MODULE_ERR_RING_BUFFER_OVERFLOW : MODULE_ERR_OK;
 }
 
 bool m_i2c_ring_buffer_pop(nirs_sample_t *sample_out)
