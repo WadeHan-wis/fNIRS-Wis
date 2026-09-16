@@ -6,8 +6,13 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/logging/log.h>
 #include "m_i2c_as7341.h"
+#include "config_app.h"
 
+#if TEMP_AS7341_RAW_DBG_LOG
+LOG_MODULE_REGISTER(m_i2c_as7341, LOG_LEVEL_DBG);
+#else
 LOG_MODULE_REGISTER(m_i2c_as7341, LOG_LEVEL_INF);
+#endif
 
 /* SMUX RAM 20바이트 (레지스터 0x00~0x13) — F5~F8+Clear+NIR 구성 (m_i2c_as7341.h 상단
  * 매핑 주석 참고). datasheet DS000504에는 SMUX 바이트 표가 없어(ams AN000633 앱노트

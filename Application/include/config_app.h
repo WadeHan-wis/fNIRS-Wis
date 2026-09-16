@@ -16,7 +16,7 @@ extern "C" {
  */
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 0
-#define FW_VERSION_PATCH 10
+#define FW_VERSION_PATCH 13
 
 /* nirs_sample_t.fw_version(uint16_t)에 담기 위한 패킹: MAJOR(4bit)|MINOR(4bit)|PATCH(8bit) */
 #define FW_VERSION_PACKED \
@@ -106,6 +106,31 @@ typedef enum {
  * 검증 방식(ISR 디버깅 로그 확인)에 대응. 검증 끝나면 0으로 되돌린다.
  */
 #define TEMP_RTC_TICK_LOG_TEST 0
+
+/* TEMP(하드웨어 진단용, 2026-09-15): BLE 스택(bt_enable) 추가 후 AS7341(NIR1) SMUX
+ * 구성 성공 로그가 안 보이고 부팅이 특정 지점에서 멈추는 문제 격리용. 1이면
+ * m_ble.c가 bt_enable()/advertising을 건너뛰어 BLE 없이 AS7341/RTC가 정상 동작
+ * 하는지만 확인한다. 원인 확정 후 0으로 되돌린다.
+ */
+#define TEMP_BLE_DISABLE_TEST 0
+
+/* TEMP(개발용, 2026-09-16): 테스트 APK로 수신되는 DATA0/DATA1 raw 값이 AS7341이 실제로
+ * 읽은 값과 일치하는지 검증하기 위해, RTT 로그(m_i2c_as7341.c의 F5~NIR LOG_DBG)를
+ * 앱 연동 중에도 확인할 수 있게 임시로 로그 레벨을 올린다. 검증 끝나면 0으로 되돌린다.
+ */
+#define TEMP_AS7341_RAW_DBG_LOG 1
+
+/* Watchdog (Rev3, R3-1, 2026-09-16): m_i2c/m_ble Task가 각자 루프마다 m_ctrl_notify_alive()로
+ * 생존 신호를 보내고, m_ctrl은 둘 다 최근 WATCHDOG_ALIVE_STALE_MS 이내에 응답했을 때만
+ * 하드웨어 watchdog을 feed한다 — I2C 버스 hang 등으로 한쪽이라도 멈추면 feed가 끊겨서
+ * SoC가 자동 리셋된다. 온도/배터리 센서가 없는 PoC v1 보드(architecture.md §11)에서
+ * 구현 가능한 유일한 Rev3 안전장치라 우선 적용한다.
+ * TIMEOUT은 AS7341 STATUS2 폴링 최악 케이스(NIR1+NIR2 순차 최대 400ms, CHANGELOG 참고)와
+ * RTC 100ms tick 주기에 충분한 여유를 둔 값 — 실측 후 필요하면 조정한다.
+ */
+#define WATCHDOG_TIMEOUT_MS 4000
+#define WATCHDOG_ALIVE_STALE_MS 1000
+#define WATCHDOG_CHECK_PERIOD_MS 500
 
 #ifdef __cplusplus
 }

@@ -238,6 +238,20 @@ static void handle_device_on_tick(void)
 			    I2C_LED_INDICATOR_DUTY_PERMILLE);
 }
 
+/* BLE 연결이 끊기면 측정을 멈추고 "디바이스 On 순차점등" 상태로 되돌린다
+ * (2026-09-16, R2-2 재연결 시나리오 구현 — 연결 해제 후에도 계속 센싱하던 문제 수정).
+ * i2c_init()의 시나리오 1 진입 로직과 동일하게 LED 0번부터 다시 순차 점등을 시작한다.
+ */
+static void reset_to_device_on(void)
+{
+	m_i2c_led_all_off();
+	s_led_mode = I2C_LED_MODE_DEVICE_ON;
+	s_device_on_led_index = 0;
+	s_device_on_tick_count = 0;
+	s_seq_num = 0;
+	m_i2c_led_set_duty((nirs_wavelength_t)s_device_on_led_index, I2C_LED_INDICATOR_DUTY_PERMILLE);
+}
+
 static void handle_ble_blink_tick(void)
 {
 	s_blink_led_on = !s_blink_led_on;
@@ -310,10 +324,19 @@ void m_i2c_task_entry(void *p1, void *p2, void *p3)
 			break;
 
 		case I2C_LED_MODE_BLE_BLINK:
+			if (!m_ctrl_is_ble_connected()) {
+				reset_to_device_on();
+				break;
+			}
 			handle_ble_blink_tick();
 			break;
 
 		case I2C_LED_MODE_ACQUISITION:
+			if (!m_ctrl_is_ble_connected()) {
+				reset_to_device_on();
+				break;
+			}
+
 			acquire_one_sample(&sample);
 
 			module_err_t err = m_i2c_ring_buffer_push(&sample);
@@ -323,6 +346,10 @@ void m_i2c_task_entry(void *p1, void *p2, void *p3)
 			}
 			break;
 		}
+
+		/* Watchdog(Rev3, R3-1) 생존 신호 — 이 tick의 작업(I2C 읽기 포함)이 끝까지
+		 * 진행됐다는 뜻이므로 루프 맨 끝에서 호출한다 (m_ctrl.h 참고). */
+		m_ctrl_notify_alive(CTRL_ALIVE_I2C);
 	}
 }
 

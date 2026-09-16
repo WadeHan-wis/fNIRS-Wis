@@ -133,3 +133,98 @@
   3. (참고, 코드 아님) NIR2 추가로 `nirs_sample_t.raw`가 2배로 커져 BLE batch 크기
      추정치(architecture.md A3, "샘플당 약 16~20byte" 가정, `BLE_BATCH_MAX_SAMPLES=12`)가
      더 이상 맞지 않음 — Rev2(R2-1) 착수 전 재계산 필요.
+
+## v0.0.11 (2026-09-15)
+
+- **BLE 실 스택 착수** — 테스트 APK(`sw/fnirs-visualizer-app-release.apk`) 호환 연동이 목표.
+  파일 트리는 S2(NCS_TedreamS2) 관례 계승: `m_ble.c`(태스크/광고/연결) / `m_ble_gatt.c`(GATT
+  서비스·characteristic 선언) / `m_ble_proto.c`(패킷 인코드·디코드) 3분할 신규 추가.
+  프로토콜 바이트 포맷 자체는 S2가 아니라 APK가 요구하는 고정 스펙을 따른다.
+- APK `classes.dex` 문자열 분석(jadx/apktool 없이 grep -a로 진행)으로 확인한 값 반영:
+  기기명 `nRF_fNIRS_Sys_v2`, 서비스 `AS7341_SERVICE_UUID`(00001523-1212-efde-1523-785feabcd123),
+  characteristic `AS7341_CONFIG/DATA0/DATA1_UUID`(0x1525/1526/1527, sensor0/1=NIR1/NIR2 대응).
+  TODO(open-item): 4개 UUID 값과 4개 이름의 정확한 매핑, CONFIG write의 바이트 레이아웃은
+  아직 미검증 — `m_ble_proto_on_config_write()`가 raw bytes를 로그로 남기도록 구현해둠
+  (실기+APK 연동 시 LED 슬라이더 조작하며 캡처해서 역설계 예정).
+- Zephyr BLE peripheral 활성화(`CONFIG_BT`, `bt_enable()`, `AS7341_SERVICE_UUID` advertising),
+  connected 콜백에서 `m_ctrl_notify_ble_connected()` 연동.
+- **[버그 수정] I2C/BLE 초기화 순서 경합**: `bt_enable()`이 AS7341(NIR1) SMUX 폴링 도중
+  (`k_sleep(1ms)` 구간)에 끼어들면 I2C1 트랜잭션이 멈추는 문제를 실기에서 확인(재현율 100%,
+  RTT 로그가 WHOAMI 이후 진행 없이 멈춤). I2C Task가 AS7341 초기화(성공/실패 무관) 완료 후
+  `sem_i2c_init_done`을 주고, BLE Task는 `bt_enable()` 전에 이 신호를 기다리도록 수정 — 이후
+  NIR1/NIR2 모두 3/3 재현 성공. 추가로 RTC 시작 시점도 BLE `bt_enable()` 완료 후로 미뤄서
+  (`sem_ble_init_done`) RTC2의 100ms 인터럽트가 BLE 스택 초기화 도중 계속 발생하지 않게 했다.
+- **[진단, 버그 아님으로 결론]** 수정 후에도 RTT 로그가 "AS7341 초기화 완료" 직후 특정
+  지점에서 계속 멈추는 현상을 추가 조사 — J-Link로 CPU를 직접 halt해서 fault handler
+  미도달·CycleCnt 정상 진행(=idle 상태)을 확인했고, 결정적으로 **Zephyr 표준 `samples/bluetooth/beacon`
+  예제를 동일 보드·툴체인으로 빌드해도 동일한 지점 근처에서 RTT 캡처가 끊기는 것**을
+  확인 — 우리 코드 결함이 아니라 `bt_enable()`이 초기 로그를 대량 출력하는 구간에서
+  이 환경의 JLinkRTTLogger가 못 따라가는 캡처 툴 한계로 결론. **실기 BLE advertising 최종
+  성공 여부는 RTT로 확인 불가 — 폰(nRF Connect 등)으로 `nRF_fNIRS_Sys_v2` 스캔 확인이
+  필요(미검증 상태로 남김)**.
+
+## v0.0.12 (2026-09-16)
+
+- **DATA0/DATA1 실 notify 구현** — v0.0.11까지는 ring buffer를 소비만 하고 버리는
+  S2식 batch placeholder였음(`send_batch()`가 no-op). `m_ble.c`에서 샘플을 pop할
+  때마다 `m_ble_proto_encode_sample()` + `m_ble_gatt_notify_data0/1()`로 즉시
+  NIR1→DATA0/NIR2→DATA1 notify하도록 교체. 테스트 APK 프로토콜은 배치가 아니라
+  샘플 1개당 notify 1회를 기대하므로 S2 batching은 이번 마일스톤에는 적용하지 않음
+  (`m_ble_batch.c/h`는 삭제하지 않고 Rev2 프로덕션 프로토콜용으로 유지, 현재는 미사용).
+  notify 실패는 §6(silent 버림 금지)에 따라 `s_notify_drop_count`(실전송 실패)/
+  `s_notify_skip_count`(미연결·미구독 정상 상태)로 구분 카운트.
+- `TEMP_AS7341_RAW_DBG_LOG` 플래그 추가(config_app.h) — `m_i2c_as7341.c`의 기존
+  `LOG_DBG(F5~NIR raw)`를 앱 연동 중에도 RTT로 확인할 수 있게 로그 레벨 상향.
+  **검증 완료**: RTT 로그 값과 앱(Logcat `fNIRS_RAW`) 수신 hex/decoded 값이 정확히
+  일치함을 실기에서 확인 — 인코딩/프로토콜 정합성 검증 완료.
+- **[버그 수정] BLE 연결 해제 후에도 계속 센싱하던 문제** — `m_ctrl_notify_ble_disconnected()`
+  신규 추가(`m_ctrl.h/c`), `m_i2c.c`에 `reset_to_device_on()` 추가해 BLE_BLINK/ACQUISITION
+  상태에서 매 tick `m_ctrl_is_ble_connected()`를 확인, 연결 끊기면 즉시 측정을 멈추고
+  LED 순차점등(디바이스 On) 상태로 복귀 + `seq_num` 리셋. 실기 검증 완료(LED 정상 복귀).
+- **[버그 수정] 연결 해제 후 advertising이 재개되지 않던 문제** — Zephyr peripheral은
+  연결되면 advertising이 자동 중단되고 해제 후 자동 재시작되지 않음. 최초 수정(disconnected
+  콜백에서 `bt_le_adv_start()` 직접 호출)은 LED는 복귀하지만 광고는 안 살아나는 증상이
+  실기에서 재현됨 — SoftDevice Controller가 disconnect HCI 이벤트를 마무리하는 도중이라
+  광고 시작 명령이 조용히 실패하는 것으로 추정. 시스템 워크큐(`k_work_submit`)로 재시작을
+  한 틱 미루도록 수정 후 **실기 재검증 완료 — 연결 해제 즉시 앱에서 재스캔 가능**.
+- **테스트 Android 앱(`fNIRS_Android_Kotlin`, 별도 저장소) 동시 수정**:
+  - DATA0/DATA1 수신 raw hex+decoded 값을 Logcat(`fNIRS_RAW`)과 화면 하단 "Raw Notify
+    Log" 탭(1526/1527 전환)으로 확인 가능하도록 추가.
+  - **[버그 수정] 재연결 시 AS7341 Controls 값이 기기 기본값으로 보이던 문제**: 매 연결마다
+    CONFIG characteristic을 무조건 읽어서 UI를 덮어쓰던 로직을, 앱 최초 연결 시에만 읽고
+    이후 재연결부터는 앱이 마지막으로 알던 설정을 기기에 다시 쓰도록 변경.
+  - **[버그 수정] Start CSV가 실제로는 저장 안 되던 문제**: 공용 Documents 폴더에 File
+    API로 직접 쓰던 방식이 Android 10+ scoped storage에서 조용히 실패 — 최초엔 앱 전용
+    외부 저장소(`getExternalFilesDir`)로 우회했다가, 사용자 요청으로 **MediaStore API
+    기반 `Documents/fnirs_rawdata/` 공용 경로**로 재변경(권한 요청 없이 공용 폴더 쓰기
+    가능, API29 미만은 기존 File API로 폴백). 파일명 `{yyyy-MM-dd_HH-mm-ss}_fNIRS_RAW_DATA.csv`.
+    adb로 실기 저장 파일 4개(정상 헤더+데이터) 확인해 정상 동작 재검증 완료.
+- **실기 검증 완료**: 앱 연동 BLE advertising/연결/재연결, CONFIG write→LED PWM 제어,
+  DATA0/DATA1 raw data 품질(RTT 대조 일치) — v0.0.11에서 미검증으로 남겼던 항목들 전부 해소.
+  파장별 정량 캘리브레이션은 레퍼런스 데이터 미확보로 계속 보류(architecture.md A12).
+- (참고, 코드 아님) 로컬 개발 환경(NCS 툴체인 Python)에서 Windows 레지스트리의 별도
+  Python 3.12 설치 `PythonPath` 키가 cmake reconfigure 시 `ctypes`를 깨뜨리는 문제를
+  발견 — 해당 레지스트리 값 제거로 해결(다른 Python 설치의 정상 실행에는 영향 없음,
+  이 저장소 코드와 무관한 로컬 머신 설정 이슈).
+
+## v0.0.13 (2026-09-16)
+
+- **[하드웨어 갭 기록] 온도센서/배터리 IC 부재** — PoC v1 스키마틱(`docs/SCH_fNIRS_Sleep_Project.pdf`)
+  검토 결과, Thermal 보호(§7)와 배터리 잔량 모니터링(§8)에 필요한 하드웨어가 아예 없음을 확인:
+  온도센서(NTC/디지털) 미실장, fuel gauge/monitor IC 미실장, 게다가 nRF52832의 ADC 가능 핀
+  (P0.02~P0.05/AIN0~AIN3)이 전부 LED 제어 신호로 이미 점유돼 있어 VBAT 저항분배를 붙일 여유
+  ADC 핀도 없음. 소프트웨어로 우회 불가능한 순수 하드웨어 제약이라 architecture.md §7/§8/§11에
+  경고 문구와 "다음 보드 리비전 반영 예정" 항목으로 기록. Rev3(Reliability) 범위에서 Thermal/
+  Battery 항목은 제외하고 Watchdog만 우선 진행하기로 결정.
+- **Watchdog 구현 (R3-1)** — nRF52832 내장 WDT(`wdt0`, 보드 dts 기본 `status="okay"`라
+  devicetree overlay 변경 없이 `CONFIG_WATCHDOG=y`만으로 사용 가능)를 `m_ctrl.c`가 소유.
+  `m_i2c`/`m_ble` Task가 각자 메인 루프 끝에서 `m_ctrl_notify_alive(CTRL_ALIVE_I2C/BLE)`로
+  생존 신호를 보내고, `m_ctrl` Task는 `K_MSEC(WATCHDOG_CHECK_PERIOD_MS=500)` 주기로 깨어나
+  두 소스 모두 `WATCHDOG_ALIVE_STALE_MS(1000ms)` 이내에 응답했을 때만 `wdt_feed()`를 호출한다
+  — 한쪽이라도(예: I2C 버스 hang) 멈추면 feed가 끊겨 `WATCHDOG_TIMEOUT_MS(4000ms)` 후 SoC
+  전체가 자동 리셋된다(`WDT_FLAG_RESET_SOC`). 타임아웃 값은 AS7341 STATUS2 폴링 최악 케이스
+  (NIR1+NIR2 순차 최대 400ms, v0.0.7 CHANGELOG 참고)에 여유를 둔 값 — 실측 후 조정 가능.
+  CTRL 태스크의 에러 메시지 큐 처리(`k_msgq_get`)도 기존 `K_FOREVER`에서 같은 주기의
+  `K_MSEC` 타임아웃으로 바꿔 watchdog feed 체크와 한 루프에서 같이 돈다.
+- **빌드 검증 완료** — FLASH 62.66%/RAM 59.66%. **하드웨어 검증 미실시** — 실기에서 I2C
+  버스를 의도적으로 막아 watchdog 리셋이 실제로 발생하는지(fault injection) 확인 필요.

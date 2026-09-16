@@ -1,5 +1,6 @@
 {
     "nrf-connect.applications": [
         "${workspaceFolder}\\Application"
-    ]
+    ],
+    "cmake.sourceDirectory": "C:/Wade/00_project/fNIRS/code/Application"
 }

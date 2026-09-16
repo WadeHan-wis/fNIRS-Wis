@@ -48,11 +48,14 @@ ctrl_state_t m_ctrl_get_state(void);
 
 /* BLE 연결 상태 중계 (m_ble → m_ctrl → m_i2c). Acquisition(m_i2c)과 BLE는 서로 직접
  * 결합하지 않고 CTRL을 거친다 (architecture.md §2.2, codingstandard.md §4:
- * Acquisition↔BLE는 ring buffer로만 통신). m_ble가 실제 BLE 연결 콜백(Rev2)에서
- * m_ctrl_notify_ble_connected()를 호출하면, m_i2c는 m_ctrl_is_ble_connected()를
- * polling해서 LED 점멸→측정 전환 시점을 판단한다.
+ * Acquisition↔BLE는 ring buffer로만 통신). m_ble가 연결 콜백에서
+ * m_ctrl_notify_ble_connected()를, 연결 해제 콜백에서 m_ctrl_notify_ble_disconnected()를
+ * 호출하면, m_i2c는 m_ctrl_is_ble_connected()를 polling해서 "디바이스 On 순차점등 →
+ * BLE 10회 점멸 → 측정" 전환과, 연결 해제 시 다시 처음 상태로 되돌리는 시점을 판단한다
+ * (2026-09-16, R2-2 재연결 시나리오 구현).
  */
 void m_ctrl_notify_ble_connected(void);
+void m_ctrl_notify_ble_disconnected(void);
 bool m_ctrl_is_ble_connected(void);
 
 /* AS7341_CONFIG(0x1525) write 중계 (m_ble → m_ctrl → m_i2c), 위와 동일한 이유로
@@ -68,6 +71,20 @@ void m_ctrl_notify_as7341_config(const uint8_t config[CTRL_AS7341_CONFIG_LEN]);
 /* out에 최신 설정을 복사하고 true 반환 — 새 설정이 이전에 소비된 뒤 다시 갱신되지
  * 않았으면 false (m_i2c가 매 tick 이걸 확인해서 "새 설정이 있을 때만" 적용한다). */
 bool m_ctrl_take_as7341_config(uint8_t out[CTRL_AS7341_CONFIG_LEN]);
+
+/* Watchdog 생존 신호 (Rev3, R3-1, 2026-09-16). m_i2c/m_ble Task가 각자 메인 루프
+ * 반복마다 1회 호출해서 "이번 루프까지 정상 진행했다"를 알린다. m_ctrl은 등록된
+ * 소스 전부가 최근에 응답했을 때만 하드웨어 watchdog을 feed하므로, 한쪽 태스크가
+ * (예: I2C 버스 hang으로) 멈추면 feed가 끊겨 SoC 전체가 자동 리셋된다.
+ * ISR에서는 호출하지 않는다 (다른 m_ctrl_notify_*류와 동일한 제약).
+ */
+typedef enum {
+	CTRL_ALIVE_I2C = 0,
+	CTRL_ALIVE_BLE,
+	CTRL_ALIVE_SOURCE_COUNT,
+} ctrl_alive_source_t;
+
+void m_ctrl_notify_alive(ctrl_alive_source_t src);
 
 #ifdef __cplusplus
 }
