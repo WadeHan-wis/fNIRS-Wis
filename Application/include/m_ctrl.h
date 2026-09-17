@@ -46,6 +46,14 @@ void m_ctrl_request_reset(ctrl_reset_reason_t reason);
 
 ctrl_state_t m_ctrl_get_state(void);
 
+/* Safety 인증 대응(2026-09-17): 단일고장(센서/통신/전원) 시 정의된 안전상태로 전이하기
+ * 위한 질의 함수. CTRL_STATE_DEGRADED/FAULT일 때 true — m_i2c는 이 값이 true인 동안
+ * LED를 끄고 측정을 중단한다(발열/오해 소지 있는 데이터 생성 방지). 설계상 래치이며
+ * 자동 복구하지 않는다(IEC 60601 단일고장 안전 철학 — 고장 원인 해소 확인 없이 자동
+ * 재개하지 않음). 복구는 재부팅(watchdog 또는 수동 전원 재인가)으로만 가능하다.
+ */
+bool m_ctrl_is_safe_state(void);
+
 /* BLE 연결 상태 중계 (m_ble → m_ctrl → m_i2c). Acquisition(m_i2c)과 BLE는 서로 직접
  * 결합하지 않고 CTRL을 거친다 (architecture.md §2.2, codingstandard.md §4:
  * Acquisition↔BLE는 ring buffer로만 통신). m_ble가 연결 콜백에서

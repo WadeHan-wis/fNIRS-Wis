@@ -83,3 +83,14 @@ uint16_t m_ble_proto_encode_sample(nir_sensor_id_t sensor_id, const nirs_sample_
 
 	return BLE_PROTO_DATA_FRAME_LEN;
 }
+
+uint16_t m_ble_proto_encode_seq(uint32_t seq_num, uint8_t out_buf[BLE_PROTO_SEQ_FRAME_LEN])
+{
+	if (out_buf == NULL) {
+		return 0;
+	}
+
+	sys_put_le32(seq_num, &out_buf[0]);
+
+	return BLE_PROTO_SEQ_FRAME_LEN;
+}

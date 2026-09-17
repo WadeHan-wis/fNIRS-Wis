@@ -40,11 +40,21 @@ typedef enum {
 	I2C_LED_MODE_DEVICE_ON = 0, /* 디바이스 On, BLE 미연결 — 1개씩 1초 간격 순차 점등 */
 	I2C_LED_MODE_BLE_BLINK,      /* BLE 연동 성공 — 10회 점멸 중 */
 	I2C_LED_MODE_ACQUISITION,    /* 정상 측정 시퀀스 */
+	/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[3]): 장시간 BLE 미연결
+	 * 저전력 대기모드. ACQUISITION 중 연결이 끊겨도 BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS
+	 * 동안은 계속 측정+버퍼링하다가(로컬 버퍼링 지속), 그 이상 끊겨 있으면 이 모드로
+	 * 전환해서 측정을 멈추고(발열/전력 절감) 짧은 점멸로 대기 상태를 표시한다.
+	 */
+	I2C_LED_MODE_STANDBY,
 } i2c_led_mode_t;
 
 static i2c_led_mode_t s_led_mode;
 static uint8_t s_blink_toggle_count;
 static bool s_blink_led_on;
+
+/* ACQUISITION 중 연속 미연결 tick 카운트 (연결되면 0으로 리셋). STANDBY 점멸용 카운터. */
+static uint32_t s_disconnect_tick_count;
+static uint32_t s_standby_blink_tick_count;
 
 static uint8_t s_device_on_led_index;
 static uint8_t s_device_on_tick_count;
@@ -156,6 +166,18 @@ static module_err_t i2c_init(void)
 	 * m_i2c_task_entry()에서 시작한다 (아래 sem_ble_init_done 관련 주석 참고).
 	 */
 
+	/* 부팅 버전 점멸 표시(config_app.h 상단 주석 참고) — SWD/RTT 없이 육안으로
+	 * OTA 적용 여부를 확인하기 위한 정식 기능. K_MSEC 사용은 여기가 RTC tick 루프
+	 * 시작 전(부팅 시퀀스 중) 1회뿐이라 문제 없음 — ISR이 아니라 일반 태스크
+	 * 컨텍스트(m_i2c_task_entry → i2c_init).
+	 */
+	for (int i = 0; i < (FW_VERSION_PATCH + 1); i++) {
+		m_i2c_led_all_on(I2C_LED_INDICATOR_DUTY_PERMILLE);
+		k_sleep(K_MSEC(FW_VERSION_BOOT_BLINK_MS));
+		m_i2c_led_all_off();
+		k_sleep(K_MSEC(FW_VERSION_BOOT_BLINK_MS));
+	}
+
 	/* 시나리오 1: 디바이스 On → LED 0번부터 1초씩 순차 점등 시작 */
 	s_led_mode = I2C_LED_MODE_DEVICE_ON;
 	s_device_on_led_index = 0;
@@ -174,6 +196,33 @@ static module_err_t i2c_init(void)
 	return m_i2c_led_set_duty((nirs_wavelength_t)s_device_on_led_index,
 				   I2C_LED_INDICATOR_DUTY_PERMILLE);
 #endif
+}
+
+/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[4]): module_err.h에 이미
+ * 정의돼 있었지만 지금까지 아무도 판정하지 않던 SATURATION/LOW_SIGNAL을 실제로 채운다.
+ * I2C 통신 에러가 이미 있으면(호출부에서 status가 OK일 때만 호출) 그쪽을 우선한다.
+ * TODO(open-item): 채널별/게인별 정확한 풀스케일 계산은 architecture.md §11의 gain/ATIME
+ * 실측 캘리브레이션과 함께 재확정 — 지금은 보수적 고정 임계값(config_app.h) 사용.
+ */
+static module_err_t check_sensor_sanity(const nirs_sample_t *sample)
+{
+	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
+		for (int wl = 0; wl < NIRS_WAVELENGTH_COUNT; wl++) {
+			if (sample->raw[i][wl] >= AS7341_SATURATION_THRESHOLD) {
+				return MODULE_ERR_SENSOR_SATURATION;
+			}
+		}
+	}
+
+	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
+		for (int wl = 0; wl < NIRS_WAVELENGTH_COUNT; wl++) {
+			if (sample->raw[i][wl] < AS7341_LOW_SIGNAL_THRESHOLD) {
+				return MODULE_ERR_SENSOR_LOW_SIGNAL;
+			}
+		}
+	}
+
+	return MODULE_ERR_OK;
 }
 
 static void acquire_one_sample(nirs_sample_t *sample)
@@ -198,6 +247,15 @@ static void acquire_one_sample(nirs_sample_t *sample)
 		if (err != MODULE_ERR_OK) {
 			sample->status = err;
 			m_ctrl_report_error(err);
+		}
+	}
+
+	if (sample->status == MODULE_ERR_OK) {
+		module_err_t sanity_err = check_sensor_sanity(sample);
+
+		if (sanity_err != MODULE_ERR_OK) {
+			sample->status = sanity_err;
+			m_ctrl_report_error(sanity_err);
 		}
 	}
 
@@ -248,8 +306,34 @@ static void reset_to_device_on(void)
 	s_led_mode = I2C_LED_MODE_DEVICE_ON;
 	s_device_on_led_index = 0;
 	s_device_on_tick_count = 0;
-	s_seq_num = 0;
+	/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[4]): seq_num은 더 이상
+	 * 여기서 리셋하지 않는다 — 부팅 세션 내내 단조증가로 유지해야 앱이 재연결 후
+	 * seq_num 불연속을 "로컬 버퍼 오버플로우로 유실된 실측 구간"의 gap 마커로 식별할
+	 * 수 있다(m_ble_proto.h 참고). */
 	m_i2c_led_set_duty((nirs_wavelength_t)s_device_on_led_index, I2C_LED_INDICATOR_DUTY_PERMILLE);
+}
+
+/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[3]): 장시간 BLE 미연결 저전력
+ * 대기모드. LED1(640nm)만 짧게 점멸해서 "동작 중이나 연결 대기" 상태를 표시한다. */
+static void handle_standby_tick(void)
+{
+	uint32_t phase = s_standby_blink_tick_count % BLE_STANDBY_BLINK_PERIOD_TICKS;
+
+	if (phase == 0) {
+		m_i2c_led_set_duty(NIRS_WAVELENGTH_640NM, I2C_LED_INDICATOR_DUTY_PERMILLE);
+	} else if (phase == BLE_STANDBY_BLINK_ON_TICKS) {
+		m_i2c_led_set_duty(NIRS_WAVELENGTH_640NM, 0);
+	}
+
+	s_standby_blink_tick_count++;
+}
+
+/* Safety 인증 대응(2026-09-17): ACQUISITION 중 장시간 미연결로 저전력 대기모드에 진입. */
+static void enter_standby(void)
+{
+	m_i2c_led_all_off();
+	s_led_mode = I2C_LED_MODE_STANDBY;
+	s_standby_blink_tick_count = 0;
 }
 
 static void handle_ble_blink_tick(void)
@@ -318,6 +402,32 @@ void m_i2c_task_entry(void *p1, void *p2, void *p3)
 		LOG_INF("RTC tick, timestamp_us=%u", m_i2c_rtc_get_timestamp_us());
 #endif
 
+#if TEMP_WATCHDOG_FAULT_INJECT_TEST
+		{
+			static uint32_t s_fault_inject_tick_count;
+
+			s_fault_inject_tick_count++;
+			if (s_fault_inject_tick_count == TEMP_WATCHDOG_FAULT_INJECT_TICKS) {
+				LOG_WRN("TEMP_WATCHDOG_FAULT_INJECT_TEST: 지금부터 m_i2c 태스크를 "
+					"고의로 멈춥니다 (watchdog 강제 유발 테스트)");
+			}
+			if (s_fault_inject_tick_count >= TEMP_WATCHDOG_FAULT_INJECT_TICKS) {
+				while (1) {
+					k_sleep(K_MSEC(100));
+				}
+			}
+		}
+#endif
+
+		/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[1]): 단일고장으로
+		 * CTRL이 안전상태(DEGRADED/FAULT)에 있으면 LED를 끄고 측정을 완전히 건너뛴다.
+		 * 래치 상태라 재부팅 전까지 자동 복구하지 않는다(m_ctrl.h 참고). */
+		if (m_ctrl_is_safe_state()) {
+			m_i2c_led_all_off();
+			m_ctrl_notify_alive(CTRL_ALIVE_I2C);
+			continue;
+		}
+
 		switch (s_led_mode) {
 		case I2C_LED_MODE_DEVICE_ON:
 			handle_device_on_tick();
@@ -331,10 +441,18 @@ void m_i2c_task_entry(void *p1, void *p2, void *p3)
 			handle_ble_blink_tick();
 			break;
 
-		case I2C_LED_MODE_ACQUISITION:
+		case I2C_LED_MODE_ACQUISITION: {
 			if (!m_ctrl_is_ble_connected()) {
-				reset_to_device_on();
-				break;
+				/* Safety 인증 대응(2026-09-17, 항목6-[3]): 즉시 멈추지 않고
+				 * grace 기간 동안 계속 측정+버퍼링(로컬 버퍼링 지속) —
+				 * 아래로 흘러서(fallthrough) 평소처럼 acquire+push한다. */
+				s_disconnect_tick_count++;
+				if (s_disconnect_tick_count >= BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS) {
+					enter_standby();
+					break;
+				}
+			} else {
+				s_disconnect_tick_count = 0;
 			}
 
 			acquire_one_sample(&sample);
@@ -344,6 +462,20 @@ void m_i2c_task_entry(void *p1, void *p2, void *p3)
 			if (err == MODULE_ERR_RING_BUFFER_OVERFLOW) {
 				m_ctrl_report_error(err);
 			}
+			break;
+		}
+
+		case I2C_LED_MODE_STANDBY:
+			if (m_ctrl_is_ble_connected()) {
+				/* 기존 재연결 흐름(10회 점멸) 재사용 후 측정 재개 */
+				s_disconnect_tick_count = 0;
+				s_led_mode = I2C_LED_MODE_BLE_BLINK;
+				s_blink_toggle_count = 0;
+				s_blink_led_on = false;
+				m_i2c_led_all_off();
+				break;
+			}
+			handle_standby_tick();
 			break;
 		}
 

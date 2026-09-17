@@ -182,9 +182,15 @@ static void notify_sample(nir_sensor_id_t sensor_id, const nirs_sample_t *sample
 		return;
 	}
 
-	if (err == -ENOTCONN) {
-		/* 연결 전/해제 후 또는 앱이 아직 notify를 구독(CCC)하지 않은 정상 상태 —
-		 * §6에 따라 silent하게 버리지 않고 카운터만 증가시킨다. */
+	if (err == -ENOTCONN || err == -EINVAL) {
+		/* 정상 상태(진짜 실패 아님) — §6에 따라 silent하게 버리지 않고 카운터만
+		 * 증가시킨다. -ENOTCONN=연결 전/해제 후. -EINVAL=앱이 아직 notify를
+		 * 구독(CCC)하지 않은 상태 — Zephyr bt_gatt_notify()가 실제로 이 에러코드를
+		 * 쓴다(gatt.c gatt_notify(): !bt_gatt_is_subscribed() 시 -EINVAL 반환,
+		 * "통신 실패"가 아니다). 2026-09-17 실기 검증 중 발견: 이전에는 -EINVAL을
+		 * 진짜 실패로 오분류해서 MODULE_ERR_BLE_TX_FAILED를 계속 보고했고, 이게
+		 * m_ctrl_is_safe_state() 도입 이후로는 앱이 연결만 하고 아직 구독 전인
+		 * 정상적인 과도 상태에서 측정을 영구 중단시키는 회귀로 이어질 뻔했다. */
 		s_notify_skip_count++;
 		return;
 	}
@@ -192,6 +198,31 @@ static void notify_sample(nir_sensor_id_t sensor_id, const nirs_sample_t *sample
 	s_notify_drop_count++;
 	LOG_WRN("BLE notify 실패(sensor=%d, err=%d), drop_count=%u", sensor_id, err,
 		s_notify_drop_count);
+	m_ctrl_report_error(MODULE_ERR_BLE_TX_FAILED);
+}
+
+/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[4]): gap 식별용 SEQ notify.
+ * DATA0/DATA1과 같은 tick에서 함께 보낸다 — 앱이 최근 SEQ/DATA notify를 짝지어
+ * seq_num 불연속(gap)을 감지할 수 있게 한다. 에러 처리는 notify_sample()과 동일
+ * 원칙(§6, -ENOTCONN/-EINVAL은 정상 상태로 skip 카운트).
+ */
+static void notify_seq(uint32_t seq_num)
+{
+	uint8_t frame[BLE_PROTO_SEQ_FRAME_LEN];
+
+	m_ble_proto_encode_seq(seq_num, frame);
+
+	int err = m_ble_gatt_notify_seq(s_conn, frame, sizeof(frame));
+
+	if (err == 0 || err == -ENOTCONN || err == -EINVAL) {
+		if (err != 0) {
+			s_notify_skip_count++;
+		}
+		return;
+	}
+
+	s_notify_drop_count++;
+	LOG_WRN("BLE SEQ notify 실패(err=%d), drop_count=%u", err, s_notify_drop_count);
 	m_ctrl_report_error(MODULE_ERR_BLE_TX_FAILED);
 }
 
@@ -217,9 +248,17 @@ void m_ble_task_entry(void *p1, void *p2, void *p3)
 	nirs_sample_t sample;
 
 	while (1) {
-		if (m_i2c_ring_buffer_pop(&sample)) {
+		/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[3]): 연결이 끊긴
+		 * 동안에는 pop하지 않는다. 예전에는 끊긴 상태에서도 계속 pop해서 notify_fn이
+		 * -ENOTCONN으로 버리고 있었다(사실상 즉시 폐기) — ring buffer는 이미 overflow 시
+		 * 가장 오래된 샘플을 덮어쓰므로(m_i2c_ring_buffer.c), pop을 멈추기만 해도
+		 * "짧은 끊김 동안 로컬 버퍼링 지속"이 자연히 동작한다. m_i2c.c는 끊긴 동안에도
+		 * 계속 acquire+push한다(reset_to_device_on() 즉시 호출 안 함, m_i2c.c 참고).
+		 */
+		if (m_ctrl_is_ble_connected() && m_i2c_ring_buffer_pop(&sample)) {
 			notify_sample(NIR_SENSOR_1, &sample, m_ble_gatt_notify_data0);
 			notify_sample(NIR_SENSOR_2, &sample, m_ble_gatt_notify_data1);
+			notify_seq(sample.seq_num);
 		} else {
 			k_sleep(K_MSEC(BLE_POLL_INTERVAL_MS));
 		}

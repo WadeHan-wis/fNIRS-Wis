@@ -228,3 +228,211 @@
   `K_MSEC` 타임아웃으로 바꿔 watchdog feed 체크와 한 루프에서 같이 돈다.
 - **빌드 검증 완료** — FLASH 62.66%/RAM 59.66%. **하드웨어 검증 미실시** — 실기에서 I2C
   버스를 의도적으로 막아 watchdog 리셋이 실제로 발생하는지(fault injection) 확인 필요.
+
+## v0.0.14 (2026-09-17)
+
+- **Safety 인증(IEC 60601-1/-1-8) 대응 필수 펌웨어 안전기능 6건 구현** (architecture.md
+  §11 항목6, HW 제약 없는 소프트웨어 항목만 — 배터리/온도 관련 4건은 HW 미실장으로 계속 보류).
+  1. **[안전상태 전이]** `m_ctrl_is_safe_state()` 신규(`m_ctrl.h/c`) — `CTRL_STATE_DEGRADED`/
+     `FAULT`일 때 true. `m_i2c.c` tick 루프 맨 앞에서 체크해서 true면 LED 소등 + 측정/
+     ring buffer push를 완전히 건너뛴다. **설계상 래치**(자동복구 없음, 재부팅으로만 해제) —
+     IEC 60601 단일고장 안전 철학에 따른 의도적 선택.
+  2. **[Watchdog 안전 재시작]** `m_ctrl.c`에 `log_reset_cause()` 추가, `CONFIG_HWINFO=y`
+     (`prj.conf`)로 RESETREAS 레지스터를 읽어 직전 리셋이 watchdog이었는지 로그로 남기고
+     `hwinfo_clear_reset_cause()`로 정리. 이 프로젝트는 원래 리셋 원인과 무관하게 항상
+     안전한 기본 상태(`I2C_LED_MODE_DEVICE_ON`)로 부팅하므로 별도 상태 복원 로직은
+     불필요 — 이번 변경은 "왜 리셋됐는지"를 사후 분석 가능하게 로그로 남기는 것.
+  3. **[BLE 끊김 로컬 버퍼링 + 저전력 대기]** **버그 수정**: `m_ble.c`가 연결 끊김 중에도
+     ring buffer를 계속 pop해서 `-ENOTCONN`으로 즉시 버리고 있었음(사실상 버퍼링이 전혀
+     안 되던 상태) — 연결 상태일 때만 pop하도록 수정. `m_i2c.c`는 연결이 끊겨도
+     `BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS`(300 tick=30초, 조정 가능) 동안은 즉시 멈추지
+     않고 계속 측정+버퍼링하다가, 그 이상 끊겨 있으면 신규 `I2C_LED_MODE_STANDBY`(LED
+     소등 + 2초마다 짧은 점멸로 대기 표시, 측정 중단으로 전력/발열 절감)로 전환. 재연결 시
+     기존 10회 점멸 경로로 복귀 후 측정 재개. `reset_to_device_on()`의 `s_seq_num = 0`
+     초기화 제거 — seq_num을 부팅 세션 내내 단조증가로 유지해야 gap 식별(아래 4번)이 가능.
+  4. **[Sanity check + gap 식별]** `m_i2c.c`에 `check_sensor_sanity()` 추가 — module_err.h에
+     이미 정의돼 있었지만 지금까지 아무도 판정하지 않던 `MODULE_ERR_SENSOR_SATURATION`/
+     `MODULE_ERR_SENSOR_LOW_SIGNAL`을 실제로 채운다(고정 임계값, `config_app.h`
+     `AS7341_SATURATION_THRESHOLD`/`AS7341_LOW_SIGNAL_THRESHOLD` — 정확한 채널별/게인별
+     풀스케일 계산은 기존 gain/ATIME 캘리브레이션 open-item과 함께 추후 재확정).
+     Gap 식별은 wire 프레임 변경 없이 위 3번의 seq_num 단조증가로 대체(앱이 seq_num
+     불연속을 감지하면 로컬 버퍼 오버플로우로 유실된 구간). CRC/체크섬은 8바이트 고정
+     프레임(테스트 APK 키건)에 추가할 여유가 없어 보류 — BLE 링크레이어 CRC24로 전송
+     무결성이 이미 확보된다고 문서화(architecture.md §11).
+  5. **[BLE 버전 characteristic 신규, 보안은 설계만]** AS7341_VERSION(0x1528, read-only)
+     characteristic 신규 추가(`m_ble_gatt.c/h`) — `{fw_version, protocol_version(=1,
+     m_ble_proto.h `BLE_PROTOCOL_VERSION`)}` 4바이트 반환. 순수 추가라 기존 CONFIG/
+     DATA0/DATA1과 테스트 APK 호환성 영향 없음. **정정**: 이전 architecture.md에
+     "펌웨어 버전 식별 기능 구현 완료"로 잘못 기록했었음 — 실제로는 `fw_version`이
+     `nirs_sample_t`에만 있고 BLE로 전송되지 않았음(`m_ble_proto_encode_sample()`이 raw
+     3값+led_index만 인코드), 이번에 이 characteristic으로 바로잡음. BLE 페어링/본딩/
+     암호화(`CONFIG_BT_SMP`/`BONDABLE`)는 **비활성 상태로 `prj.conf`에 주석만 준비** —
+     테스트 APK가 본딩을 지원하는지 불명해서 활성화 시 기존 검증된 연동이 깨질 위험이
+     있어, 앱 쪽 확인 후 활성화하기로 함(architecture.md §11).
+  6. **[OTA 인프라]** `prj.conf`에 `CONFIG_MCUMGR`/`CONFIG_MCUMGR_TRANSPORT_BT`/
+     `CONFIG_IMG_MANAGER` 등 활성화(기존 주석 처리된 TODO 실행). **`pm_static.yml`은
+     추가하지 않음** — 계획 단계에서는 신규 작성 예정이었으나, CHANGELOG v0.0.1/v0.0.11
+     기록을 재확인한 결과 sysbuild 자동 파티션 매니저가 이미 MCUboot 2-image 빌드를
+     정상 생성해온 이력이 있어(예: App Flash 32564B/216752B, mcuboot Flash 34768B/48KB),
+     하드웨어 검증 없이 손으로 파티션 오프셋을 새로 지정하는 것이 CLAUDE.md §4/§14가
+     경고하는 고위험 변경(브릭 위험)을 오히려 키운다고 판단 — 자동 파티셔닝에 맡기는
+     쪽으로 계획을 변경함. 서명키는 sysbuild 기본 자동생성 디버그 키 사용(프로덕션 키
+     관리는 별도 범위).
+  - **검증 구분(§17)**: 코드 리뷰 완료, **빌드 검증 미실시**(이 세션 환경에 west/NCS
+    툴체인이 없어 실행 불가 — 다음 실제 빌드 세션에서 clean build 확인 필요),
+    하드웨어 검증 전부 미실시(watchdog RESETREAS 로그, BLE 강제 끊김→재연결 버퍼 flush,
+    STANDBY 점멸 육안 확인, OTA 실기 업데이트/롤백/강제전원차단 3-시나리오 전부 미검증).
+
+## v0.0.15 (2026-09-17)
+
+- **빌드 환경 확인**: `C:\ncs\toolchains\`에 NCS v3.4.0 툴체인이 로컬에 설치돼 있음을
+  확인 — `west build -b nrf52dk/nrf52832 Application`(sysbuild) clean build 성공.
+  FLASH 152700B/216752B(70.45%), RAM 44152B/64KB(67.37%), `dfu_application.zip`
+  생성 확인(OTA 페이로드 실제 산출물).
+- **[버그 수정] MCUMGR Kconfig 오류(v0.0.14에서 유입)**: `CONFIG_MCUMGR_SMP_BT_AUTHEN`은
+  존재하지 않는 심볼(작성자가 잘못 지어낸 이름)이라 Kconfig 경고로 빌드 자체가
+  중단됐음 — 제거. `CONFIG_MCUMGR`가 `CONFIG_ZCBOR`에 의존하는데 누락돼 있었음 —
+  `CONFIG_ZCBOR=y` 추가. `BT_SMP` 비활성 상태에서는 `MCUMGR_TRANSPORT_BT_PERM`
+  choice가 자동으로 암호화 불필요 옵션(`_RW`)을 선택하므로 별도 설정 불필요함을 확인.
+- **실기 플래시 검증**: MCUboot+App 2-image 플래시 완료(J-Link, `nrf52dk/nrf52832`
+  타겟). 1차 시도에서 App 이미지 검증 실패(주소 0x0000c000 mismatch) — 점퍼 연결
+  불안정성으로 추정, 재시도 후 mcuboot/App 둘 다 검증 통과.
+- **[버그 수정, 중대] BLE notify 미구독 상태를 통신 실패로 오분류하던 문제**: RTT 실기
+  로그에서 `BLE notify 실패(sensor=X, err=-22)`가 반복 발생하는 것을 발견 — 앱이 실제로
+  연결돼 있었는데도 나타남. Zephyr 소스(`subsys/bluetooth/host/gatt.c` `gatt_notify()`)
+  확인 결과 `bt_gatt_notify()`의 `-EINVAL`은 "해당 characteristic에 아직 notify
+  구독(CCC) 안 됨"을 뜻하는 정상 상태이지 통신 실패가 아님을 확인(`-ENOTCONN`만
+  실제로 "연결 안 됨"). 기존 코드(v0.0.12부터)는 `-ENOTCONN` 외의 모든 에러를 진짜
+  실패로 취급해 `MODULE_ERR_BLE_TX_FAILED`를 보고하고 있었음 — 이 자체는 이전까지는
+  무해했으나(DEGRADED 상태를 아무도 소비하지 않았음), v0.0.14의 `m_ctrl_is_safe_state()`
+  도입으로 **앱이 연결 직후 아직 구독하기 전인 정상적인 과도 상태에서 측정을 영구
+  중단시키는 회귀**로 이어질 뻔했음. `m_ble.c notify_sample()`이 `-EINVAL`도
+  `-ENOTCONN`과 동일하게 정상(skip) 처리하도록 수정.
+- **검증 구분(§17)**: 빌드 검증 완료, 실기 플래시 검증 완료. **BLE notify EINVAL 수정
+  실기 재검증 완료** — 재빌드/재플래시 후 앱 연결 상태로 34초 연속 RTT 캡처, notify
+  실패 경고 0건, DATA0/DATA1 notify enabled 확인, NIR1/NIR2 raw 데이터 100ms 간격
+  연속 스트리밍 확인. `log_reset_cause()`도 실기에서 동작 확인(RESETREAS에 watchdog
+  비트 포함된 것을 감지+로깅). Watchdog fault injection, STANDBY 점멸, OTA 실기
+  업데이트/롤백/강제전원차단 3-시나리오는 여전히 미검증.
+
+## v0.0.16 (2026-09-17)
+
+- **[TEMP, OTA 실기 테스트용]** `TEMP_OTA_TEST_MARKER=1`(config_app.h) 추가 — 부팅
+  직후(디바이스 On 순차점등 진입 전) LED 3개 동시 5회 빠른 점멸(`m_i2c.c i2c_init()`).
+  OTA로 이 이미지가 실제로 올라갔는지 기존 이미지(v0.0.15, 순차 점등만 함)와 육안으로
+  바로 구분하기 위한 용도 — **OTA 테스트 완료 후 반드시 0으로 되돌릴 것**(TODO 아님,
+  영구 기능 아님). 기능 변경 없음, 오직 이 목적의 임시 마커.
+- **[버그 수정, 중대] OTA 업데이트가 "버전 체크"로 거부되던 문제**: nRF Connect Device
+  Manager에서 Start를 눌러도 업데이트가 진행되지 않는 문제 발생 — `dfu_application.zip`의
+  `manifest.json`을 열어 확인한 결과 `version_MCUBOOT: "0.0.0+0"`으로 찍혀 있었음.
+  `config_app.h`의 `FW_VERSION_*`(앱/BLE characteristic용)와 MCUboot 이미지 헤더 버전은
+  완전히 별개 체계인데, 프로젝트에 `Application/VERSION` 파일이 없어서 **지금까지의
+  모든 빌드가 전부 버전 `0.0.0+0`으로 찍히고 있었음** — 현재 보드의 이미지도, 새로
+  올리려던 이미지도 버전이 동일해서 MCUboot/Device Manager가 업데이트로 인정하지
+  않은 것으로 추정. `Application/VERSION` 신규 추가(`PATCHLEVEL=16`), pristine
+  재빌드 후 `version_MCUBOOT: "0.0.16+0"`으로 정상 반영 확인.
+  **운영 규칙(신규)**: 앞으로 패치마다 `config_app.h`의 `FW_VERSION_PATCH`와
+  `Application/VERSION`의 `PATCHLEVEL`을 **함께** 올려야 한다 — 빌드 시스템이 두
+  값을 자동으로 동기화해주지 않는다.
+- **[버그 수정, 중대] OTA 업로드 시작 시 "GATT ERROR"로 실패하던 문제**: 버전 이슈
+  해결 후에도 nRF Connect Device Manager에서 Start 시 `State: GATT ERROR`로 실패
+  (SMP Service: DISCONNECTED). 원인: `CONFIG_MCUMGR_TRANSPORT_BT_REASSEMBLY`를
+  켜지 않은 채였음 — 기본 ATT MTU(23byte)로는 SMP 업로드 요청이 여러 조각으로
+  나뉘는데, 재조립(reassembly) 없이는 조각난 요청을 처리 못 해 GATT 에러로
+  이어짐. NCS가 제공하는 공식 검증 Kconfig 번들
+  (`nrf/samples/common/mcumgr_bt_ota_dfu/Kconfig`의
+  `NCS_SAMPLE_MCUMGR_BT_OTA_DFU`/`..._SPEEDUP`)로 `prj.conf`의 수작업 MCUMGR
+  설정을 전부 교체 — reassembly, 버퍼 크기(`MCUMGR_TRANSPORT_NETBUF_SIZE=1230`),
+  연결 파라미터 제어, MTU 확장(`BT_L2CAP_TX_MTU=247`, `BT_BUF_ACL_TX/RX_SIZE=251`)이
+  한 번에 올바르게 설정됨. 이 번들은 build-time에 설정 정합성을 자체 검증하는
+  옵션도 포함(`NCS_SAMPLE_MCUMGR_BT_OTA_DFU_VALIDATION`, 기본 활성).
+- **검증 구분(§17)**: 빌드 검증 완료(image 버전 0.0.17+0, pristine rebuild 성공,
+  FLASH 오버플로우 없음). **실기 OTA 업로드 재검증 필요**(GATT ERROR 수정 후
+  아직 미확인) — 다음 실기 테스트에서 확인.
+- **[중요 교훈] OTA는 "현재 이미 설치된 이미지가 OTA를 받을 능력이 있어야" 성립**:
+  GATT ERROR 수정(reassembly 등) 반영한 v0.0.17을 만들어도, 정작 보드에 실행 중이던
+  이미지(v0.0.15, reassembly 없음)가 업데이트 요청 자체를 받을 능력이 없어서
+  계속 실패했음 — Device Manager의 "Buffer details: 1 x 20 bytes"가 결정적 단서
+  (재조립 없는 구버전의 SMP 버퍼 크기와 정확히 일치). **v0.0.17을 유선으로 한 번
+  플래시한 뒤에야** OTA 수신 능력이 생김. 이후 v0.0.18(LED 8회 점멸 마커로 변경,
+  기존 v0.0.17의 5회 점멸과 구분)을 실제로 **무선 OTA로 업데이트 성공** —
+  Device Manager Buffer details가 `4 x 2475 bytes`로 정상 확인(reassembly 반영),
+  Bootloader: MCUboot / Swap Without Scratch, 업데이트 후 재부팅 시 LED 8회
+  점멸 육안 확인 + RTT 로그로 `Board FW Version: v0.0.18` 확인. **OTA 실기 검증
+  완료** (§17) — 최초 1회는 반드시 유선 플래시 필요, 이후 SMP 설정이 유지되는 한
+  버전 상승 방향으로는 무선 업데이트 가능함을 확인. 롤백/강제전원차단 시나리오는
+  아직 미검증.
+
+## v0.1.1 (2026-09-17)
+
+- **버전 체계 전환**: OTA 실기 검증 성공을 기점으로 `FW_VERSION_MINOR`를 0→1로 올려
+  새 관리 기준선을 v0.1.1로 삼는다(`config_app.h`, `Application/VERSION`). 이후
+  패치는 v0.1.1 → v0.1.2 → ... `TEMP_OTA_TEST_MARKER`는 정식 버전이므로 0으로 원복.
+  v0.0.18(OTA 최초 성공 버전)에서 이 버전으로 OTA 업그레이드 실기 검증 완료 —
+  1차 시도 GATT ERROR(재시도로 성공, BLE 연동 준비 지연으로 추정·설정 문제 아님),
+  재시도 후 RTT 로그로 `Board FW Version: v0.1.1` 정상 확인.
+- **[정책 결정] OTA 다운그레이드 실기 검증 및 의도적 허용**: MCUboot
+  `check_downgrade_prevention()`은 `CONFIG_MCUBOOT_DOWNGRADE_PREVENTION`이 켜져
+  있을 때만 동작하는데, 현재 빌드에는 이 옵션이 없음을 `.config`로 확인 —
+  즉 지금은 낮은 버전으로도 OTA가 그대로 적용된다. v0.1.1에서 v0.1.0(다운그레이드
+  테스트용 임시 이미지, 실사용 릴리스 아님, LED 3회 점멸 마커)으로 실제 다운그레이드
+  실기 검증 완료(RTT: `Board FW Version: v0.1.0`). **사용자 결정(2026-09-17)**:
+  인증/테스트 단계에서는 다운그레이드를 의도적으로 열어둔다(펌웨어를 이전 버전으로
+  되돌려 비교/재현해야 하는 경우가 있음) — **양산 배포 시점에 `CONFIG_MCUBOOT_
+  DOWNGRADE_PREVENTION`을 활성화하는 것은 사용자가 별도로 진행**하기로 함
+  (architecture.md §11에 기록).
+- 다운그레이드 테스트 후 코드 상태는 다시 v0.1.1(정식 기준선)로 원복. 보드는
+  v0.1.0 상태이므로 **다음 작업 전 v0.1.1로 다시 OTA 업그레이드 필요**.
+- 사용자가 v0.1.0→v0.1.1 OTA 업그레이드 재실기, RTT로 `Board FW Version: v0.1.1`
+  정상 확인.
+
+## v0.1.2 (2026-09-17)
+
+- **[신규] 부팅 버전 점멸 표시** — SWD/RTT 연결 없이(조립된 상태) 육안으로 OTA
+  적용 여부를 확인하고 싶다는 요청으로 추가. 오늘 쓰던 `TEMP_OTA_TEST_MARKER`를
+  대체하는 정식 기능으로 승격: 부팅 직후(디바이스 On 순차점등 진입 전) LED 3개가
+  동시에 `FW_VERSION_PATCH + 1`회 점멸한다(`config_app.h` `FW_VERSION_BOOT_BLINK_MS`,
+  `m_i2c.c i2c_init()`). +1은 PATCH=0일 때 "0회 점멸"(표시 없음)이 되는 것을 피하기
+  위함 — v0.1.1은 2회, 이 버전(v0.1.2)은 3회 점멸. 업데이트 전/후 점멸 횟수 변화만
+  보면 OTA 성공 여부를 육안으로 판단할 수 있다.
+- **[정정] "seq_num 기반 gap 식별 가능"은 과장된 주장이었음** — `m_ble_proto_
+  encode_sample()`의 DATA0/DATA1 8바이트 프레임에는 raw 3값+led_index만 들어가고
+  `seq_num`은 애초에 전송되지 않는다(이전부터 그랬음, 오늘 seq_num 리셋을 없앤 것과
+  무관하게 앱은 이 값을 볼 방법이 없음). architecture.md §11 항목6-[4] "gap 식별
+  방식 확정"을 "인프라 미비, 실질적 gap 식별 불가"로 정정 필요 — TODO(open-item):
+  AS7341_VERSION(0x1528)처럼 seq_num을 노출하는 추가 characteristic이 필요하다
+  (기존 DATA0/DATA1 프레임 변경은 테스트 APK 호환성 문제로 비권장).
+- **[실기 검증 완료] OTA 강제 전원차단 시나리오**: 업데이트 전송 도중 디바이스 전원을
+  끊으면 MCUboot가 손상된 이미지로 스왑하지 않고 원래(이전) 버전으로 안전하게
+  부팅 롤백됨을 확인. 재부팅 후 BLE도 자동으로 재연결되어 OTA를 이어서 진행할 수
+  있음을 실기로 확인 — "Swap Without Scratch" 방식의 원자적 스왑 안전성이 실제로
+  보장됨을 검증. 남은 미검증 항목은 "의도적으로 손상시킨(서명 불일치) 이미지
+  업로드 시 롤백" 시나리오뿐.
+- **[버그 수정] gap 식별용 seq_num이 실제로는 앱에 전달되지 않던 문제** — 신규
+  AS7341_SEQ(0x1529, notify-only, u32 LE) characteristic 추가(`m_ble_gatt.h/c`,
+  `m_ble_proto.c m_ble_proto_encode_seq()`, `m_ble.c notify_seq()`). DATA0/DATA1과
+  같은 tick에서 함께 notify되므로, 앱은 최근 SEQ/DATA notify를 짝지어 seq_num
+  불연속을 감지하면 그 구간이 로컬 buffer 오버플로우로 유실된 실측 구간임을 알 수
+  있다. 순수 추가(additive)라 기존 CONFIG/DATA0/DATA1/VERSION 동작과 테스트 APK
+  호환성에 영향 없음(앱이 이 characteristic을 구독하지 않으면 그냥 무시됨).
+  **빌드 검증 완료, 실기 검증 필요**(테스트 APK가 이 characteristic을 아직 모르므로
+  BLE 스니퍼 또는 nRF Connect 범용 앱으로 notify 값 확인 필요).
+- **[실기 검증 완료] SEQ characteristic 실기 확인** — nRF Connect 범용 앱으로 구독,
+  100ms 간격으로 notify 값이 올라옴을 확인. **설계적 한계 발견**: BLE Notification은
+  ATT 레벨에서 ACK가 없는 fire-and-forget이라, 관찰상 불규칙하게(+2 정도) 값이
+  건너뛰는 현상이 있었음 — RTT로 `RING_BUFFER_OVERFLOW`/`BLE notify 실패` 로그가
+  전혀 없었던 것으로 볼 때, 이는 진짜 데이터 유실이 아니라 SEQ notify 패킷 개별
+  전달 실패(무해)로 판단됨. 이 방식은 "진짜 gap"과 "notify 전달 실패"를 구분하지
+  못하는 한계가 있음(architecture.md §11 항목6-[4] 기록).
+
+## v0.1.3~v0.1.4 (2026-09-17)
+
+- **[TEMP, watchdog 실기 fault injection 테스트용]** `TEMP_WATCHDOG_FAULT_INJECT_TEST`
+  추가 — 부팅 후 20번째 tick(약 2초)에서 `m_i2c` 태스크가 고의로 무한 대기하며
+  `m_ctrl_notify_alive()` 호출을 멈춘다. **실기 검증 완료**: RTT로 연속 캡처한 결과
+  ①경고 로그 발생(t≈3.2s) → ②약 4초 후 하드웨어 watchdog이 SoC 강제 리셋 →
+  ③재부팅 시 `log_reset_cause()`가 `RESETREAS=0x00000010`(watchdog 비트)을 정확히
+  감지+경고 로그 — 이 사이클이 반복되는 것을 두 번 연속 확인. **item [2](Watchdog
+  안전 재시작 시퀀스) 실기 검증 완료로 확정**.
+- 테스트 완료 후 `TEMP_WATCHDOG_FAULT_INJECT_TEST`를 0으로 원복(v0.1.4) — 무한
+  리셋 루프에서 정상 동작으로 복귀.

@@ -12,11 +12,15 @@ extern "C" {
 
 /* --- 보드(PoC v1) 펌웨어 버전 ---
  * v0.0.1부터 시작, 패치 적용마다 PATCH를 1씩 올린다 (v0.0.1 → v0.0.2 → ...).
+ * 2026-09-17: OTA(무선 펌웨어 업데이트) 실기 검증 성공을 기점으로 v0.1.1부터
+ * MINOR를 1로 올려 새 관리 기준선으로 삼는다(Application/VERSION 파일과 반드시
+ * 함께 갱신 — MCUboot 이미지 버전은 이 값이 아니라 그 파일을 따로 읽는다,
+ * CHANGELOG.md v0.0.15 참고). 이후 패치는 v0.1.1 → v0.1.2 → ...
  * 버전 이력은 CHANGELOG.md 참고.
  */
 #define FW_VERSION_MAJOR 0
-#define FW_VERSION_MINOR 0
-#define FW_VERSION_PATCH 13
+#define FW_VERSION_MINOR 1
+#define FW_VERSION_PATCH 4
 
 /* nirs_sample_t.fw_version(uint16_t)에 담기 위한 패킹: MAJOR(4bit)|MINOR(4bit)|PATCH(8bit) */
 #define FW_VERSION_PACKED \
@@ -94,6 +98,16 @@ typedef enum {
  */
 #define I2C_LED_BLE_CONNECT_BLINK_COUNT 10
 
+/* 부팅 버전 점멸 표시 (2026-09-17, architecture.md §11 항목6-[6] OTA 검증 과정에서
+ * 도입 — TEMP_OTA_TEST_MARKER를 대체하는 정식 기능). SWD/RTT 연결 없이(조립된 상태)
+ * 육안으로 "OTA가 실제로 적용됐는지"를 확인할 수 있어야 한다는 요구로 추가됨.
+ * 부팅 직후(디바이스 On 순차점등 진입 전) LED 3개를 동시에 (FW_VERSION_PATCH + 1)회
+ * 점멸한다. +1을 더하는 이유는 PATCH=0일 때 "0회 점멸"(=아무 표시도 없음)이 되는
+ * 것을 피하기 위함 — 예: v0.1.1 → 2회 점멸, v0.1.2로 업데이트하면 3회 점멸로 바뀐다.
+ * 업데이트 전/후 점멸 횟수가 달라졌는지만 보면 성공 여부를 판단할 수 있다.
+ */
+#define FW_VERSION_BOOT_BLINK_MS 150
+
 /* TEMP(개발용, 2026-09-15): AS7341 채널-파장 매핑 실측 검증용. 1이면 BLE 연동 대기 없이
  * 부팅 즉시 측정 시퀀스(acquisition)로 진입해서 raw 채널 값을 RTT로 바로 확인할 수 있다.
  * 실제 BLE(Rev2)가 준비되기 전까지의 임시 우회이며, 검증 끝나면 0으로 되돌린다.
@@ -131,6 +145,38 @@ typedef enum {
 #define WATCHDOG_TIMEOUT_MS 4000
 #define WATCHDOG_ALIVE_STALE_MS 1000
 #define WATCHDOG_CHECK_PERIOD_MS 500
+
+/* TEMP(watchdog 실기 fault injection 테스트용, 2026-09-17): 1이면 m_i2c 태스크가
+ * 부팅 후 TEMP_WATCHDOG_FAULT_INJECT_TICKS번째 tick에서 완전히 멈춘다(m_ctrl_notify_alive
+ * 호출 중단) — feed_watchdog_if_alive()가 stale을 감지해 feed를 멈추고, WATCHDOG_TIMEOUT_MS
+ * 후 하드웨어가 SoC를 강제 리셋하는지, 재부팅 후 log_reset_cause()가 이 리셋을
+ * watchdog으로 정확히 로그하는지 확인하기 위함. 검증 끝나면 반드시 0으로 되돌린다.
+ */
+#define TEMP_WATCHDOG_FAULT_INJECT_TEST 0
+#define TEMP_WATCHDOG_FAULT_INJECT_TICKS 20
+
+/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[3]): BLE 연결이 끊겨도
+ * 즉시 측정을 멈추지 않고 ring buffer에 계속 버퍼링하다가, 이 tick 수를 넘겨도 재연결이
+ * 안 되면 저전력 대기모드(I2C_LED_MODE_STANDBY)로 전환한다. RTC tick = 100ms(SAMPLE_RATE_HZ)
+ * 기준이므로 300 tick = 30초. 제품 정책값 아님 — 실측 후 조정 가능한 초기값이다.
+ */
+#define BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS 300
+
+/* STANDBY 중 "살아있음 + 연결 대기 중"을 알리는 저전력 점멸 패턴 — LED1(640nm)만
+ * BLE_STANDBY_BLINK_PERIOD_TICKS(2초)마다 BLE_STANDBY_BLINK_ON_TICKS(100ms) 짧게 켠다.
+ */
+#define BLE_STANDBY_BLINK_PERIOD_TICKS 20
+#define BLE_STANDBY_BLINK_ON_TICKS 1
+
+/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[4]): AS7341 채널 raw 값
+ * sanity check 임계값. SATURATION은 16bit ADC 하드 한계(0xFFFF)로 판정하고, LOW_SIGNAL은
+ * 노이즈 플로어 근접값으로 판정한다. TODO(open-item): 채널별/게인별 정확한 풀스케일 계산은
+ * architecture.md §11의 gain/ATIME 실측 캘리브레이션 항목과 함께 재확정 필요 — 지금은
+ * 코드 전체에 정의만 있고 아무도 판정하지 않던 SATURATION/LOW_SIGNAL 상태를 실제로
+ * 채우는 것이 목적이라 보수적인 고정 임계값을 사용한다.
+ */
+#define AS7341_SATURATION_THRESHOLD 0xFFFF
+#define AS7341_LOW_SIGNAL_THRESHOLD 10
 
 #ifdef __cplusplus
 }

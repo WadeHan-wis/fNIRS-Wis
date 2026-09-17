@@ -34,10 +34,32 @@
 #define BT_UUID_AS7341_DATA1_VAL \
 	BT_UUID_128_ENCODE(0x00001527, 0x1212, 0xefde, 0x1523, 0x785feabcd123)
 
+/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[5]): 순수 추가(additive)
+ * characteristic — 기존 CONFIG/DATA0/DATA1과 테스트 APK 호환성에 영향 없음(구버전 앱은
+ * 이 characteristic의 존재를 모르고 무시할 뿐). read-only, {fw_version(u16 LE),
+ * protocol_version(u16 LE)} 4바이트를 반환한다 (m_ble_proto.h BLE_PROTOCOL_VERSION 참고).
+ * 기존 UUID 번호(0x1523/1525/1526/1527)를 이어 0x1528 사용.
+ */
+#define BT_UUID_AS7341_VERSION_VAL \
+	BT_UUID_128_ENCODE(0x00001528, 0x1212, 0xefde, 0x1523, 0x785feabcd123)
+
+/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[4] 정정): gap 식별용.
+ * DATA0/DATA1 8바이트 프레임에는 seq_num이 애초에 없어서(고정 프로토콜, 앱 키건이라
+ * 프레임 자체를 못 바꿈) 앱이 gap을 감지할 방법이 없었다 — 순수 추가(additive)
+ * characteristic으로 seq_num(u32 LE)만 별도 notify한다. m_ble.c가 DATA0/DATA1과
+ * 같은 tick에서 함께 notify하므로, 앱은 "가장 최근 SEQ notify 값"과 "가장 최근
+ * DATA0/DATA1 notify"를 같은 샘플로 짝지어 seq_num 불연속(재연결 후 gap)을
+ * 감지할 수 있다. 기존 UUID 이어 0x1529 사용.
+ */
+#define BT_UUID_AS7341_SEQ_VAL \
+	BT_UUID_128_ENCODE(0x00001529, 0x1212, 0xefde, 0x1523, 0x785feabcd123)
+
 #define BT_UUID_AS7341_SERVICE BT_UUID_DECLARE_128(BT_UUID_AS7341_SERVICE_VAL)
 #define BT_UUID_AS7341_CONFIG  BT_UUID_DECLARE_128(BT_UUID_AS7341_CONFIG_VAL)
 #define BT_UUID_AS7341_DATA0   BT_UUID_DECLARE_128(BT_UUID_AS7341_DATA0_VAL)
 #define BT_UUID_AS7341_DATA1   BT_UUID_DECLARE_128(BT_UUID_AS7341_DATA1_VAL)
+#define BT_UUID_AS7341_VERSION BT_UUID_DECLARE_128(BT_UUID_AS7341_VERSION_VAL)
+#define BT_UUID_AS7341_SEQ     BT_UUID_DECLARE_128(BT_UUID_AS7341_SEQ_VAL)
 
 /* GATT 서비스는 m_ble_gatt.c에 BT_GATT_SERVICE_DEFINE으로 정적 등록된다.
  * m_ble.c는 이 파일의 함수만으로 advertising/notify를 다룬다 — attribute 배열
@@ -48,5 +70,8 @@ void m_ble_gatt_init(void);
 /* DATA0(NIR1)/DATA1(NIR2) notify. conn이 NULL이면 아무 것도 하지 않는다(연결 전 호출 방지). */
 int m_ble_gatt_notify_data0(struct bt_conn *conn, const uint8_t *data, uint16_t len);
 int m_ble_gatt_notify_data1(struct bt_conn *conn, const uint8_t *data, uint16_t len);
+
+/* SEQ(gap 식별용 seq_num) notify — DATA0/DATA1과 함께 매 샘플마다 호출된다. */
+int m_ble_gatt_notify_seq(struct bt_conn *conn, const uint8_t *data, uint16_t len);
 
 #endif /* M_BLE_GATT_H_ */

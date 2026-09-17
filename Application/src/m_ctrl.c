@@ -2,6 +2,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/drivers/watchdog.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/logging/log.h>
 #include "m_ctrl.h"
 #include "config_app.h"
@@ -52,6 +53,11 @@ void m_ctrl_request_reset(ctrl_reset_reason_t reason)
 ctrl_state_t m_ctrl_get_state(void)
 {
 	return g_ctrl_status;
+}
+
+bool m_ctrl_is_safe_state(void)
+{
+	return g_ctrl_status == CTRL_STATE_DEGRADED || g_ctrl_status == CTRL_STATE_FAULT;
 }
 
 void m_ctrl_notify_ble_connected(void)
@@ -113,6 +119,32 @@ void m_ctrl_notify_alive(ctrl_alive_source_t src)
  * 보고하고 계속 진행 — s_wdt_channel_id가 음수로 남아 feed_watchdog_if_alive()가 아무것도
  * 하지 않는다(watchdog 보호가 없는 상태로 동작, 완전히 멈추지는 않음).
  */
+/* Safety 인증 대응(2026-09-17): 이전 부팅이 watchdog 리셋이었는지 RESETREAS 레지스터로
+ * 확인해서 사후 분석용으로 남긴다. 이 프로젝트는 리셋 원인과 무관하게 항상 안전한 기본
+ * 상태(I2C_LED_MODE_DEVICE_ON, m_i2c.c i2c_init() 참고)에서 부팅하므로 "이전 상태 복구"
+ * 로직 자체는 필요 없다 — 이 함수는 "왜 리셋됐는지"를 로그로 남기는 것이 목적이다
+ * (architecture.md §11 항목6 참고). ISR이 아니라 태스크 컨텍스트에서 1회만 호출.
+ */
+static void log_reset_cause(void)
+{
+	uint32_t cause = 0;
+	int err = hwinfo_get_reset_cause(&cause);
+
+	if (err != 0) {
+		LOG_WRN("hwinfo_get_reset_cause 실패 (err=%d) — 리셋 원인 확인 불가", err);
+		return;
+	}
+
+	if (cause & RESET_WATCHDOG) {
+		LOG_WRN("직전 부팅 리셋 원인: Watchdog (RESETREAS=0x%08X) — "
+			"안전한 기본 상태(DEVICE_ON)로 재시작", cause);
+	} else {
+		LOG_INF("직전 부팅 리셋 원인 플래그: 0x%08X", cause);
+	}
+
+	(void)hwinfo_clear_reset_cause();
+}
+
 static void watchdog_init(void)
 {
 	if (!device_is_ready(s_wdt_dev)) {
@@ -203,6 +235,7 @@ void m_ctrl_task_entry(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
+	log_reset_cause();
 	watchdog_init();
 
 	ctrl_msg_t msg;

@@ -42,6 +42,31 @@ extern "C" {
 
 #define BLE_PROTO_CONFIG_LEN 10
 
+/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[5]): AS7341_VERSION
+ * characteristic(0x1528, m_ble_gatt.c)으로 노출되는 프로토콜 버전. DATA0/DATA1/CONFIG의
+ * 바이트 레이아웃이 바뀌면 이 값을 올린다. 현재 이 값을 읽고 비교해서 구버전을 거부하는
+ * 로직은 앱 쪽에 구현이 없다(테스트 APK는 이 characteristic 자체를 모름) — 프로토콜
+ * 버전 협상은 앱이 이 값을 읽고 대응하도록 업데이트된 뒤에나 실효성이 생기는
+ * 인프라이며, 지금은 "읽을 수 있게" 만드는 것까지가 이번 범위다 (architecture.md §11 참고).
+ *
+ * gap 식별(재구성 vs 실측 데이터 구분, architecture.md §11 항목6-[4]): DATA0/DATA1
+ * 프레임에는 별도 gap 플래그를 넣을 여유가 없다(8바이트 고정, 앱 키건) — **정정
+ * (2026-09-17)**: 처음엔 seq_num을 리셋 안 하는 것만으로 충분하다고 봤으나, 애초에
+ * DATA0/DATA1 프레임에 seq_num 자체가 안 들어있어서 앱이 볼 방법이 없었다(과장된
+ * 주장이었음, CHANGELOG v0.1.2 참고). 이를 바로잡기 위해 AS7341_SEQ(0x1529, 순수
+ * 추가 characteristic, m_ble_gatt.h)를 신설 — DATA0/DATA1과 같은 tick에서 seq_num
+ * (u32 LE)을 별도 notify한다(`m_ble_proto_encode_seq()`). 앱은 "가장 최근 SEQ
+ * notify"와 "가장 최근 DATA0/DATA1 notify"를 같은 샘플로 짝지어서, seq_num
+ * 불연속(이전값+1이 아님)이 보이면 그 구간이 "로컬 ring buffer 오버플로우로 유실된
+ * 실측 구간"이라고 판단할 수 있다.
+ */
+#define BLE_PROTOCOL_VERSION 1
+
+/* SEQ notify 프레임 — seq_num(u32 LE) 그대로. */
+#define BLE_PROTO_SEQ_FRAME_LEN 4
+
+uint16_t m_ble_proto_encode_seq(uint32_t seq_num, uint8_t out_buf[BLE_PROTO_SEQ_FRAME_LEN]);
+
 void m_ble_proto_init(void);
 
 /* AS7341_CONFIG read/write 콜백 (m_ble_gatt.c의 BT_GATT_CHARACTERISTIC에서 그대로
