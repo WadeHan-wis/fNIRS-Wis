@@ -54,12 +54,24 @@
 #define BT_UUID_AS7341_SEQ_VAL \
 	BT_UUID_128_ENCODE(0x00001529, 0x1212, 0xefde, 0x1523, 0x785feabcd123)
 
+/* gap 식별 한계 개선(architecture.md §11 항목6-[4] 후속, 2026-09-18): SEQ notify는
+ * ATT 레벨에서 ACK 없는 fire-and-forget이라 "ring buffer overflow로 인한 진짜 gap"과
+ * "SEQ notify 패킷 하나만 무해하게 유실"을 앱이 구분할 방법이 없었다. 순수 추가
+ * (additive) read-only characteristic으로 누적 overflow 카운터(u32 LE,
+ * `m_i2c_ring_buffer_get_dropped_count()`)를 노출한다 — 앱이 이 값을 폴링해서 SEQ
+ * 불연속 시점에 이 카운터도 증가했는지 대조하면 두 경우를 구분할 수 있다(앱 측 대응은
+ * 별도 작업, 여기서는 인프라만 추가). 기존 UUID 이어 0x152A 사용.
+ */
+#define BT_UUID_AS7341_DROPPED_VAL \
+	BT_UUID_128_ENCODE(0x0000152A, 0x1212, 0xefde, 0x1523, 0x785feabcd123)
+
 #define BT_UUID_AS7341_SERVICE BT_UUID_DECLARE_128(BT_UUID_AS7341_SERVICE_VAL)
 #define BT_UUID_AS7341_CONFIG  BT_UUID_DECLARE_128(BT_UUID_AS7341_CONFIG_VAL)
 #define BT_UUID_AS7341_DATA0   BT_UUID_DECLARE_128(BT_UUID_AS7341_DATA0_VAL)
 #define BT_UUID_AS7341_DATA1   BT_UUID_DECLARE_128(BT_UUID_AS7341_DATA1_VAL)
 #define BT_UUID_AS7341_VERSION BT_UUID_DECLARE_128(BT_UUID_AS7341_VERSION_VAL)
 #define BT_UUID_AS7341_SEQ     BT_UUID_DECLARE_128(BT_UUID_AS7341_SEQ_VAL)
+#define BT_UUID_AS7341_DROPPED BT_UUID_DECLARE_128(BT_UUID_AS7341_DROPPED_VAL)
 
 /* GATT 서비스는 m_ble_gatt.c에 BT_GATT_SERVICE_DEFINE으로 정적 등록된다.
  * m_ble.c는 이 파일의 함수만으로 advertising/notify를 다룬다 — attribute 배열

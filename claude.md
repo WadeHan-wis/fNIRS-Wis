@@ -229,6 +229,7 @@ event-driven을 우선한다 (`m_ble.c`의 폴링도 Rev2에서 event-driven으�
 agents.md          작업 지침 요약 (최우선 확인 대상)
 architecture.md    설계 근거, Rev 단계, AT 체크리스트, 미확정 항목
 codingstandard.md  네이밍/모듈 구조/ISR/커밋 규칙
+SESSION_NOTES.md   지난 세션 작업 요약 (최신 항목이 맨 위) — 새 세션 시작 시 함께 확인
 fNIRS_FW_v1.0_트래커.html   Day Plan / Task 체크리스트 (오늘 목표 산출물 확인용)
 ```
 

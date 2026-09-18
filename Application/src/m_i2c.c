@@ -2,6 +2,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/byteorder.h>
 #include <stdbool.h>
 #include "m_i2c.h"
 #include "m_ble.h"
@@ -64,6 +65,31 @@ static uint8_t s_device_on_tick_count;
  * 갱신한다 (2026-09-15, 테스트 APK 프로토콜 반영). */
 static uint16_t s_led_duty_permille[NIRS_WAVELENGTH_COUNT] = {500, 500, 500};
 
+/* cycle/active window(offset 6-9) 게이팅 — architecture.md §11 항목4(BLE 실 스택+APK
+ * 연동) 완료를 위해 2026-09-18 추가. RTC 100ms tick 주기 자체는 그대로 유지하고
+ * (m_ble_proto.h 상단 TODO 참고, §2.3 Bresenham 보정 대상과 분리), ACQUISITION 모드에서
+ * "이번 tick에 실제로 측정할지"만 tick 카운터로 게이팅한다. 기본값은 cycle=1/active=1
+ * tick(=항상 active, 게이팅 없음) — BLE가 CONFIG를 한 번도 안 보낸 상태(TEMP_AS7341_READ_TEST
+ * 등)에서 기존 검증된 매 tick 측정 동작을 그대로 보존하기 위함.
+ */
+static uint16_t s_gate_cycle_ticks = 1;
+static uint16_t s_gate_active_ticks = 1;
+static uint32_t s_gate_tick_count;
+
+/* ms를 RTC tick(100ms, SAMPLE_RATE_HZ 고정) 단위로 반올림 변환, 최소 1 tick 클램프
+ * (0이면 아래 % 연산이 미정의 동작이 됨). */
+static uint16_t ms_to_ticks_clamped(uint16_t ms)
+{
+	uint32_t tick_ms = 1000U / SAMPLE_RATE_HZ;
+	uint32_t ticks = ((uint32_t)ms + tick_ms / 2U) / tick_ms;
+
+	if (ticks < 1U) {
+		ticks = 1U;
+	}
+
+	return (uint16_t)ticks;
+}
+
 /* 프로토콜의 integration time 필드(u8, 1 unit=20ms)를 AS7341 ATIME 레지스터로 변환.
  * ASTEP는 m_i2c_as7341_set_integration_time()이 999로 고정하므로 그 전제로 계산한다:
  * t_int_ms = (ATIME+1) * 1000 * 2.78us = (ATIME+1) * 2.78ms.
@@ -96,8 +122,7 @@ static void apply_pending_ble_config(void)
 	}
 
 	/* LED1~4 = offset 2~5, %값. 이 보드는 LED가 3개(640/680/950nm)뿐이라 LED4는
-	 * 무시한다. TODO(open-item): cycle/active window(offset 6~9)는 RTC 100ms 고정
-	 * 샘플링에 아직 반영 안 함 — architecture.md §11 참고. */
+	 * 무시한다. */
 	for (int wl = 0; wl < NIRS_WAVELENGTH_COUNT; wl++) {
 		uint8_t percent = config[2 + wl];
 
@@ -112,9 +137,21 @@ static void apply_pending_ble_config(void)
 		m_i2c_as7341_set_integration_time(&s_as7341[i], s_fixed_integration_time);
 	}
 
-	LOG_INF("BLE config 적용: LED duty(permille)=%u/%u/%u ATIME=%u",
+	/* cycle/active window(offset 6-9) — 위 s_gate_* 주석 참고. active>cycle 클램프는
+	 * m_ble_proto.c에서 이미 처리됨. */
+	uint16_t cycle_ms = sys_get_le16(&config[6]);
+	uint16_t active_ms = sys_get_le16(&config[8]);
+
+	s_gate_cycle_ticks = ms_to_ticks_clamped(cycle_ms);
+	s_gate_active_ticks = ms_to_ticks_clamped(active_ms);
+	if (s_gate_active_ticks > s_gate_cycle_ticks) {
+		s_gate_active_ticks = s_gate_cycle_ticks;
+	}
+	s_gate_tick_count = 0;
+
+	LOG_INF("BLE config 적용: LED duty(permille)=%u/%u/%u ATIME=%u gate=%u/%u tick",
 		s_led_duty_permille[0], s_led_duty_permille[1], s_led_duty_permille[2],
-		s_fixed_integration_time);
+		s_fixed_integration_time, s_gate_active_ticks, s_gate_cycle_ticks);
 }
 
 /* main()에서 호출하지 않는다 — m_i2c_task_entry() 진입 직후 태스크 컨텍스트에서
@@ -225,6 +262,13 @@ static module_err_t check_sensor_sanity(const nirs_sample_t *sample)
 	return MODULE_ERR_OK;
 }
 
+/* 이번 tick이 cycle/active window의 active 구간인지 판정 — 호출부(ACQUISITION 분기)가
+ * true일 때만 acquire_one_sample()을 호출한다. */
+static bool is_gate_active_tick(void)
+{
+	return (s_gate_tick_count % s_gate_cycle_ticks) < s_gate_active_ticks;
+}
+
 static void acquire_one_sample(nirs_sample_t *sample)
 {
 	sample->timestamp_us = m_i2c_rtc_get_timestamp_us();
@@ -255,6 +299,8 @@ static void acquire_one_sample(nirs_sample_t *sample)
 
 		if (sanity_err != MODULE_ERR_OK) {
 			sample->status = sanity_err;
+			LOG_WRN("센서 sanity check 실패: %s (§11 항목6-[4] 실기 검증용 가시화, 2026-09-18)",
+				sanity_err == MODULE_ERR_SENSOR_SATURATION ? "SATURATION" : "LOW_SIGNAL");
 			m_ctrl_report_error(sanity_err);
 		}
 	}
@@ -331,6 +377,9 @@ static void handle_standby_tick(void)
 /* Safety 인증 대응(2026-09-17): ACQUISITION 중 장시간 미연결로 저전력 대기모드에 진입. */
 static void enter_standby(void)
 {
+	LOG_INF("BLE 연결 끊김 %u tick(%ums) 초과 -> STANDBY 진입 (§11 항목6-[3] 실기 검증용 "
+		"가시화, 2026-09-18)",
+		s_disconnect_tick_count, s_disconnect_tick_count * (1000U / SAMPLE_RATE_HZ));
 	m_i2c_led_all_off();
 	s_led_mode = I2C_LED_MODE_STANDBY;
 	s_standby_blink_tick_count = 0;
@@ -351,6 +400,7 @@ static void handle_ble_blink_tick(void)
 	/* 토글 1회=100ms, 점멸(on+off) 1회=2 toggle → N회 점멸=2N toggle */
 	if (s_blink_toggle_count >= (I2C_LED_BLE_CONNECT_BLINK_COUNT * 2)) {
 		s_led_mode = I2C_LED_MODE_ACQUISITION;
+		s_gate_tick_count = 0; /* cycle/active window를 연결 시점부터 정렬해서 시작 */
 		m_i2c_led_all_off(); /* 측정 시퀀스에서 파장별로 개별 점등하므로 우선 소등 */
 	}
 }
@@ -445,7 +495,10 @@ void m_i2c_task_entry(void *p1, void *p2, void *p3)
 			if (!m_ctrl_is_ble_connected()) {
 				/* Safety 인증 대응(2026-09-17, 항목6-[3]): 즉시 멈추지 않고
 				 * grace 기간 동안 계속 측정+버퍼링(로컬 버퍼링 지속) —
-				 * 아래로 흘러서(fallthrough) 평소처럼 acquire+push한다. */
+				 * 아래로 흘러서(fallthrough) 평소처럼 acquire+push한다.
+				 * TODO(open-item, architecture.md §11 항목7, 2026-09-18): 테스트 APK가
+				 * disconnect 후 자동 재연결을 안 해서 이 grace period를 매번 끝까지
+				 * 체감하게 됨 — 펌웨어 동작은 그대로 유지, 앱 쪽에 재연결 로직 추가 필요. */
 				s_disconnect_tick_count++;
 				if (s_disconnect_tick_count >= BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS) {
 					enter_standby();
@@ -455,13 +508,26 @@ void m_i2c_task_entry(void *p1, void *p2, void *p3)
 				s_disconnect_tick_count = 0;
 			}
 
-			acquire_one_sample(&sample);
+			/* cycle/active window(§11 항목4) — active 구간이 아니면 acquire 자체를
+			 * 건너뛴다(LED off 상태 유지, sanity check 오탐 방지, 위 is_gate_active_tick()
+			 * 주석 참고). seq_num은 push된 샘플에만 증가하므로 gap 식별(SEQ notify)
+			 * 의미는 그대로 유지된다. */
+			if (is_gate_active_tick()) {
+				acquire_one_sample(&sample);
 
-			module_err_t err = m_i2c_ring_buffer_push(&sample);
+				module_err_t err = m_i2c_ring_buffer_push(&sample);
 
-			if (err == MODULE_ERR_RING_BUFFER_OVERFLOW) {
-				m_ctrl_report_error(err);
+				if (err == MODULE_ERR_RING_BUFFER_OVERFLOW) {
+					LOG_WRN("Ring buffer overflow, dropped_count=%u (§11 항목6-[4] 실기 "
+						"검증용 가시화, 2026-09-18)",
+						m_i2c_ring_buffer_get_dropped_count());
+					m_ctrl_report_error(err);
+				}
+			} else {
+				m_i2c_led_all_off();
 			}
+
+			s_gate_tick_count++;
 			break;
 		}
 

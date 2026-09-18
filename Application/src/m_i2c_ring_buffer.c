@@ -75,12 +75,28 @@ bool m_i2c_ring_buffer_pop(nirs_sample_t *sample_out)
 	return popped;
 }
 
+/* gap 식별 한계 개선(2026-09-18, m_ble_gatt.c on_dropped_count_read() 참고)으로 BT 호스트
+ * 스레드에서도 이 getter를 호출하게 됐다 — m_i2c 태스크(push 시 증가)와의 cross-task
+ * 읽기이므로 mutex로 보호한다(codingstandard.md §8, "volatile만으로 충분하다고
+ * 가정하지 않는다"). */
 uint32_t m_i2c_ring_buffer_get_dropped_count(void)
 {
-	return g_dropped_sample_count;
+	uint32_t count;
+
+	k_mutex_lock(&mtx_ring_buffer, K_FOREVER);
+	count = g_dropped_sample_count;
+	k_mutex_unlock(&mtx_ring_buffer);
+
+	return count;
 }
 
 uint32_t m_i2c_ring_buffer_get_max_usage(void)
 {
-	return g_max_ring_buffer_usage;
+	uint32_t usage;
+
+	k_mutex_lock(&mtx_ring_buffer, K_FOREVER);
+	usage = g_max_ring_buffer_usage;
+	k_mutex_unlock(&mtx_ring_buffer);
+
+	return usage;
 }

@@ -436,3 +436,105 @@
   안전 재시작 시퀀스) 실기 검증 완료로 확정**.
 - 테스트 완료 후 `TEMP_WATCHDOG_FAULT_INJECT_TEST`를 0으로 원복(v0.1.4) — 무한
   리셋 루프에서 정상 동작으로 복귀.
+
+## v0.1.5 (2026-09-18)
+
+- **주간과제4(BLE 실 스택+APK 연동 PWM 제어) 미달성 지점 해소: AS7341_CONFIG의
+  cycle/active window(offset 6-9)를 실제 LED 구동에 반영**. 그동안 `m_ble_proto.c`가
+  파싱·클램프만 하고 `m_i2c.c`는 duty(%)만 적용해서, 앱이 "1초 주기 중 200ms만
+  점등"처럼 설정해도 실기에서는 duty%로 계속 켜져 있는 상태였다(`m_ble_proto.h`의
+  TODO(open-item) 참고).
+- `m_i2c.c`에 tick 기반 게이팅 추가: RTC 100ms tick 주기 자체(§2.3 Bresenham 보정)는
+  건드리지 않고, ACQUISITION 모드에서 "이번 tick이 active 구간인지"만
+  `s_gate_tick_count % s_gate_cycle_ticks < s_gate_active_ticks`로 판정한다.
+  active 구간이 아니면 `acquire_one_sample()` 자체를 건너뛴다 — LED만 끄고 AS7341
+  read를 계속하면 `check_sensor_sanity()`가 매 tick `LOW_SIGNAL`로 오판해
+  `g_ctrl_status`를 영구 `WARNING`으로 전환시키는 부작용이 있어(다운그레이드 경로
+  없음, `m_ctrl.c` 참고) acquire 자체를 스킵하는 방식을 택했다. `seq_num`은 push된
+  샘플에만 증가하므로 gap 식별(SEQ notify, §11 항목6-4) 의미도 그대로 유지된다.
+- 기본값은 cycle=1 tick/active=1 tick(항상 active, 게이팅 없음) — BLE가 CONFIG를
+  한 번도 안 보낸 상태(`TEMP_AS7341_READ_TEST` 등)에서 기존 검증된 매 tick 측정
+  동작을 그대로 보존하기 위함. `cycle=1000ms/active=200ms` 기본 프로토콜 값은 우리
+  100ms RTC tick과 정수배(10 tick/2 tick)로 정확히 나누어떨어짐을 확인.
+- TODO(open-item): 빌드/실기 검증 미실시(이 세션 환경에 west/NCS 툴체인 없음, §17).
+  다음 실제 빌드 세션에서 clean build 확인 후 앱 연동 실측 필요.
+
+## v0.1.6 (2026-09-18)
+
+- **[코드 변경 없음, 문서만] v0.1.5 실기 검증 결과 정리**: cycle/active window 게이팅이
+  실제로 정상 동작함을 RTT 로그로 확인 — `gate=1/1 tick`(cycle=100ms/active=20ms처럼
+  1 tick 미만인 값)에서는 게이팅이 no-op이 되는 것도 예측대로 확인됨. `cycle=1000ms/
+  active=200ms`로 재테스트 시 육안으로도 정상 동작 확인(사용자 확인, 2026-09-18).
+- **BLE 연결 해제 후 LED가 즉시 순차 점등으로 안 돌아오는 것처럼 보인 문제 조사** —
+  펌웨어 버그가 아니라 **테스트 APK가 disconnect 후 자동 재연결을 시도하지 않아서**
+  항목6-[3]의 30초 grace period(`BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS`)를 매번 끝까지
+  체감하게 되는 것으로 확인됨(advertising 자체는 disconnect 즉시 정상 재시작, RTT 로그
+  확인). **펌웨어 동작은 그대로 유지하기로 결정** — architecture.md §11 항목7로 기록,
+  `m_i2c.c`에 TODO(open-item) 주석 추가(앱 쪽 자동 재연결 로직 추가 필요, 펌웨어 범위 아님).
+
+## v0.1.7 (2026-09-18)
+
+- **오늘 할 일 중 앱 변경과 무관하게 FW 단독으로 안전한 항목만 적용**: BLE
+  암호화(항목5-[4])는 architecture.md §11에 이미 "앱 본딩 지원 확인 전까지 보류
+  확정"으로 기록돼 있어 제외, OTA 손상 이미지 롤백 검증은 코드 패치가 아닌 수기
+  검증 절차라 제외. gap 식별 개선(항목5-[3])만 순수 추가 인프라로 적용.
+- **AS7341_DROPPED_COUNT(0x152A, read-only, u32 LE) characteristic 신설**
+  (`m_ble_gatt.h`/`m_ble_gatt.c`) — VERSION(0x1528)/SEQ(0x1529)와 동일한 순수 추가
+  패턴, 구버전 앱 호환성 영향 없음. `m_i2c_ring_buffer_get_dropped_count()`가
+  구현만 되고 아무도 호출하지 않던 죽은 코드였음을 발견해 여기 연결했다 — 앱이
+  이 값과 SEQ 불연속을 대조하면 "진짜 ring buffer overflow"와 "SEQ notify 개별
+  무해 유실"을 구분할 수 있다(실제 대조 로직은 앱 쪽 작업으로 남김).
+- **[버그 수정] `m_i2c_ring_buffer_get_dropped_count()`/`get_max_usage()`가 mutex
+  보호 없이 값을 읽고 있었다** — 지금까지 호출부가 없어서 문제가 드러나지 않았지만,
+  이번에 BT 호스트 스레드(GATT read 콜백)에서 처음으로 cross-task 호출하게 되면서
+  `mtx_ring_buffer`로 감싸도록 수정(codingstandard.md §8).
+
+## v0.1.8 (2026-09-18)
+
+- **[코드 변경 없음, 문서만] OTA 손상 이미지 롤백 케이스 A 실기 검증 완료**: 정상
+  서명된 `zephyr.signed.bin`의 payload 중간 1바이트만 변조한 사본을 OTA로 업로드 →
+  재부팅 후 `Board FW Version`/git hash가 업데이트 전과 완전히 동일(v0.1.5-
+  45c7b088fdec)하고 I2C/BLE init도 전부 정상 — MCUboot가 서명 검증에서 손상된
+  이미지를 거부하고 swap을 진행하지 않은 것으로 판단(MCUboot 자체 부팅 로그는
+  캡처하지 못해 100% 확정은 아님, 정황 증거 기준). architecture.md §11 항목6-[6]에
+  기록.
+- **남은 케이스 B(서명 정상, confirm 미실행 시 자동 롤백)는 미검증** — west 빌드로
+  구분 가능한 새 버전 이미지가 필요해서 이번 세션에서는 진행하지 못함.
+
+## v0.1.9 (2026-09-18)
+
+- **[코드 변경 없음, 문서만] OTA 케이스 B 시도 — 근거 불완전, 사용자 판단으로 pass
+  처리**: v0.1.8을 test 업로드 후 confirm 없이 리셋해서 RTT 확인 시도. 1차 부팅
+  (v0.1.8이어야 할 부팅)의 `Board FW Version` 배너가 RTT 캡처 과정에서 깨져서 안
+  보였고, 2차 부팅만 `v0.1.5`로 깨끗하게 잡힘 — "1차에서 v0.1.8이 떴다가 롤백된 것"과
+  "애초에 swap이 안 일어난 것"을 로그만으로 구분 불가. 사용자가 육안 관찰 근거로
+  pass 처리했으나 **RTT 로그 상 명확한 증거는 없음** — architecture.md §11 항목6-[6]에
+  근거 불완전 상태 그대로 기록. 재확인 필요 시 리셋 전 RTT 터미널을 미리 연결해서
+  1차 부팅 배너부터 캡처해야 함.
+- **후속(같은 날)**: Test 업데이트를 반복 실행하면서 매번 동일한 패턴(재부팅 후 이전
+  버전으로 복귀)이 일관되게 재현됨을 확인 — 사용자 판단으로 케이스 B도 검증 완료
+  (100%) 처리. architecture.md §11 항목6-[6] 갱신, 정식 자동화 TC는 양산 단계에서
+  추가 예정.
+
+## v0.1.10 (2026-09-18)
+
+- **Safety 인증 대응 항목5-[2]/[3] 실기 검증 가시화용 로그 추가** (코드 리뷰로는
+  완료 상태였으나 실기로 한 번도 트리거해본 적 없던 두 경로):
+  - `enter_standby()`(`m_i2c.c`)에 STANDBY 진입 로그 추가 — 30초 grace period
+    (`BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS`) 만료 시점을 RTT로 확인 가능하게 함.
+  - ring buffer overflow 시(`m_i2c_ring_buffer_push()` 반환값 체크 지점) 누적
+    dropped count를 포함한 경고 로그 추가.
+  - `check_sensor_sanity()` 실패 시(SATURATION/LOW_SIGNAL) 어느 쪽인지 구분되는
+    경고 로그 추가.
+  - 세 로그 모두 동작 변경 없이 가시성만 추가한 것 — RING_BUFFER_CAPACITY(150)
+    기준 10Hz 샘플링이면 약 15초 연결 끊기면 overflow, 30초면 STANDBY 진입이라
+    한 번의 45초 연결 끊기 테스트로 두 경로를 동시에 확인 가능.
+
+## v0.1.11 (2026-09-18)
+
+- **[코드 변경 없음, 문서만] 항목5-[2]/[3] 실기 검증을 다음으로 연기하기로 결정** —
+  SWD 연결이 불안정해서(9/17 watchdog 검증 때와 동일한 문제) RTT 로그 캡처 자체가
+  너무 어려움. `JLinkRTTLogger.exe`로 파일에 직접 기록하는 방법을 안내했으나, SWD
+  안정성 문제가 근본 원인이라 오늘은 검증을 보류. v0.1.10에서 추가한 로그는 그대로
+  유효하니 SWD 환경이 안정적일 때 재시도하면 됨. architecture.md §11 항목6-[2]/[3]에
+  연기 사유 기록.
