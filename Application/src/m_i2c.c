@@ -90,25 +90,6 @@ static uint16_t ms_to_ticks_clamped(uint16_t ms)
 	return (uint16_t)ticks;
 }
 
-/* 프로토콜의 integration time 필드(u8, 1 unit=20ms)를 AS7341 ATIME 레지스터로 변환.
- * ASTEP는 m_i2c_as7341_set_integration_time()이 999로 고정하므로 그 전제로 계산한다:
- * t_int_ms = (ATIME+1) * 1000 * 2.78us = (ATIME+1) * 2.78ms.
- */
-static uint16_t integration_units_to_atime(uint8_t units)
-{
-	uint32_t t_int_us = (uint32_t)units * 20000U;
-	uint32_t atime_plus1 = (t_int_us + 1390U) / 2780U; /* +denom/2 반올림 */
-
-	if (atime_plus1 < 1U) {
-		atime_plus1 = 1U;
-	}
-	if (atime_plus1 > 256U) {
-		atime_plus1 = 256U;
-	}
-
-	return (uint16_t)(atime_plus1 - 1U);
-}
-
 /* RTC tick마다(모드 무관) 호출 — BLE로부터 새 AS7341_CONFIG가 도착했으면 적용한다.
  * Acquisition↔BLE 직접 결합 금지 원칙에 따라 m_ctrl을 경유해서만 받는다
  * (m_ctrl.h/m_ble_proto.h 상단 주석 참고, 2026-09-15).
@@ -132,9 +113,12 @@ static void apply_pending_ble_config(void)
 		s_led_duty_permille[wl] = (uint16_t)percent * 10U;
 	}
 
-	s_fixed_integration_time = integration_units_to_atime(config[0]);
+	/* config[0]은 BLE AS7341_CONFIG의 integration time 필드(u8, 1 unit=20ms)로,
+	 * m_i2c_as7341_set_integration_time()의 단위와 동일해서 별도 변환 없이 그대로 넘긴다
+	 * (2026-09-21, ATIME 고정+ASTEP 가변 방식으로 레퍼런스와 동일하게 정정). */
+	s_fixed_integration_time = config[0];
 	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
-		m_i2c_as7341_set_integration_time(&s_as7341[i], s_fixed_integration_time);
+		m_i2c_as7341_set_integration_time(&s_as7341[i], (uint8_t)s_fixed_integration_time);
 	}
 
 	/* cycle/active window(offset 6-9) — 위 s_gate_* 주석 참고. active>cycle 클램프는
@@ -149,7 +133,7 @@ static void apply_pending_ble_config(void)
 	}
 	s_gate_tick_count = 0;
 
-	LOG_INF("BLE config 적용: LED duty(permille)=%u/%u/%u ATIME=%u gate=%u/%u tick",
+	LOG_INF("BLE config 적용: LED duty(permille)=%u/%u/%u integration=%u(x20ms) gate=%u/%u tick",
 		s_led_duty_permille[0], s_led_duty_permille[1], s_led_duty_permille[2],
 		s_fixed_integration_time, s_gate_active_ticks, s_gate_cycle_ticks);
 }
@@ -185,18 +169,27 @@ static module_err_t i2c_init(void)
 		return err;
 	}
 
+	/* [버그 수정, 2026-09-21] I2C bus stuck 재시도(m_i2c_as7341_init() 최대 3회)가 걸리면
+	 * 이 지점까지도 시간이 늘어날 수 있어, 아래 블로킹 구간(버전 점멸) 진입 전에 한 번
+	 * 더 alive를 보고해둔다 (watchdog stale 오탐 방지, 아래 점멸 루프 주석 참고). */
+	m_ctrl_notify_alive(CTRL_ALIVE_I2C);
+
 	/* architecture.md §4/§5: 초기 검증 단계에서는 gain/integration time 고정값 사용.
 	 * gain=0(0.5x)/ATIME=0(2.78ms)으로는 실기에서 raw 값이 거의 0(노이즈 수준)이라
-	 * 광학 반응 확인이 안 됨을 확인 — gain=9(256x)/ATIME=29(약 83ms)로 변경, 실기에서
-	 * 6채널 모두 안정적인 비영(非零) 값을 확인했다 (2026-09-15, NIR1 기준).
-	 * TODO(open-item): 채널별 saturation 임계 게인은 아직 실측/확정 전 — 이 값은 "동작 확인"
-	 * 수준이며 최종 게인/적분시간은 모바일 연동 raw data 수집 후 재조정한다 (architecture.md §11).
+	 * 광학 반응 확인이 안 됨을 확인 — gain=9(256x)는 2026-09-15 실기 검증(83ms 적분시간
+	 * 기준)에서 6채널 모두 안정적인 비영(非零) 값을 확인한 값이라 그대로 유지한다(레퍼런스
+	 * 기본 CFG1 리셋값도 동일하게 9).
+	 * 적분시간 기본값은 2026-09-21 "레퍼런스와 동일 세팅" 결정에 따라 _ref_fnirs_example의
+	 * AS7341_DEFAULT_INTEGRATION_20MS(=1 unit=20ms 목표, 실제 ATIME=99 고정+ASTEP=70 →
+	 * 약 19.7ms)로 정정 — 기존 83ms 대비 짧아졌으므로, 이 값에서도 신호가 노이즈 수준으로
+	 * 떨어지지 않는지 다음 실기 검증에서 재확인 필요(TODO open-item, architecture.md §11
+	 * 항목5의 gain/ATIME 실측 캘리브레이션과 함께 처리).
 	 */
 	s_fixed_gain = 9;
-	s_fixed_integration_time = 29;
+	s_fixed_integration_time = 1;
 	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
 		m_i2c_as7341_set_gain(&s_as7341[i], s_fixed_gain);
-		m_i2c_as7341_set_integration_time(&s_as7341[i], s_fixed_integration_time);
+		m_i2c_as7341_set_integration_time(&s_as7341[i], (uint8_t)s_fixed_integration_time);
 	}
 
 	/* RTC 시작(ticking)은 여기서 하지 않는다 — BLE bt_enable()이 끝난 뒤
@@ -208,11 +201,19 @@ static module_err_t i2c_init(void)
 	 * 시작 전(부팅 시퀀스 중) 1회뿐이라 문제 없음 — ISR이 아니라 일반 태스크
 	 * 컨텍스트(m_i2c_task_entry → i2c_init).
 	 */
+	/* [버그 수정, 2026-09-21] 이 루프는 (FW_VERSION_PATCH+1)*2*FW_VERSION_BOOT_BLINK_MS만큼
+	 * 블로킹되는데, m_ctrl_notify_alive(CTRL_ALIVE_I2C)는 아래 RTC tick 메인루프에 들어가야만
+	 * 호출된다 — watchdog은 CTRL 태스크 시작 즉시 무장되므로(m_ctrl.c watchdog_init()),
+	 * PATCH가 커질수록(패치마다 무조건 +1) 이 루프 시간이 watchdog 타임아웃(4000ms)을
+	 * 넘어서면 아직 아무 문제도 없는데 watchdog 리셋이 걸린다(v0.1.13, PATCH=13에서 14*300=
+	 * 4200ms로 실제 발생 확인). 매 tick마다 alive 신호를 보내 이 블로킹 구간에서도 stale
+	 * 판정을 받지 않게 한다. */
 	for (int i = 0; i < (FW_VERSION_PATCH + 1); i++) {
 		m_i2c_led_all_on(I2C_LED_INDICATOR_DUTY_PERMILLE);
 		k_sleep(K_MSEC(FW_VERSION_BOOT_BLINK_MS));
 		m_i2c_led_all_off();
 		k_sleep(K_MSEC(FW_VERSION_BOOT_BLINK_MS));
+		m_ctrl_notify_alive(CTRL_ALIVE_I2C);
 	}
 
 	/* 시나리오 1: 디바이스 On → LED 0번부터 1초씩 순차 점등 시작 */

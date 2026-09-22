@@ -30,6 +30,11 @@ bool m_i2c_ring_buffer_pop(nirs_sample_t *sample_out);
 uint32_t m_i2c_ring_buffer_get_dropped_count(void);
 uint32_t m_i2c_ring_buffer_get_max_usage(void);
 
+/* BLE Task에서 호출(2026-09-21, batching 도입). pop하지 않고 현재 쌓인 샘플 수만
+ * 확인한다 — 배치 크기만큼 모였는지 미리 확인한 뒤 한 번에 pop해서, 누적 버퍼에 샘플이
+ * 오래 머무는 것을 피한다(재연결 안전장치인 ring buffer 밖에서 유실될 위험 최소화). */
+uint32_t m_i2c_ring_buffer_count(void);
+
 #ifdef __cplusplus
 }
 #endif

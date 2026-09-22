@@ -51,6 +51,11 @@
  * DATA0/DATA1 notify"를 같은 샘플로 짝지어 seq_num 불연속(재연결 후 gap)을
  * 감지할 수 있다. 기존 UUID 이어 0x1529 사용.
  */
+/* [전력 최적화, 2026-09-21] v3부터 DATA0/DATA1 배칭 프레임 자체에 레코드마다
+ * seq_num이 포함되어(m_ble_proto.h 참고) 이 characteristic을 더 이상 notify하지
+ * 않는다(m_ble.c에서 호출 제거) — "같은 tick에 짝지어 notify"라는 전제가 배칭 구조와
+ * 안 맞기 때문. 하위 호환을 위해 characteristic 선언 자체는 유지(구독해도 그냥
+ * 아무 것도 안 옴, 비용 없음). */
 #define BT_UUID_AS7341_SEQ_VAL \
 	BT_UUID_128_ENCODE(0x00001529, 0x1212, 0xefde, 0x1523, 0x785feabcd123)
 
@@ -83,7 +88,9 @@ void m_ble_gatt_init(void);
 int m_ble_gatt_notify_data0(struct bt_conn *conn, const uint8_t *data, uint16_t len);
 int m_ble_gatt_notify_data1(struct bt_conn *conn, const uint8_t *data, uint16_t len);
 
-/* SEQ(gap 식별용 seq_num) notify — DATA0/DATA1과 함께 매 샘플마다 호출된다. */
+/* SEQ(gap 식별용 seq_num) notify — [전력 최적화, 2026-09-21] v3부터 m_ble.c가 더 이상
+ * 호출하지 않는다(위 BT_UUID_AS7341_SEQ_VAL 주석 참고). 함수 자체는 하위 호환/향후
+ * 재사용 가능성을 위해 남겨둔다. */
 int m_ble_gatt_notify_seq(struct bt_conn *conn, const uint8_t *data, uint16_t len);
 
 #endif /* M_BLE_GATT_H_ */

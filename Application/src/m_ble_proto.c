@@ -67,21 +67,42 @@ ssize_t m_ble_proto_on_config_write(struct bt_conn *conn, const struct bt_gatt_a
 	return len;
 }
 
-uint16_t m_ble_proto_encode_sample(nir_sensor_id_t sensor_id, const nirs_sample_t *sample,
-				    uint16_t led_index, uint8_t out_buf[BLE_PROTO_MAX_PACKET_LEN])
+uint16_t m_ble_proto_encode_batch(nir_sensor_id_t sensor_id, const nirs_sample_t *samples,
+				   uint16_t count, uint8_t *out_buf, uint16_t out_buf_cap)
 {
-	if (sample == NULL || out_buf == NULL || sensor_id >= NIR_SENSOR_COUNT) {
+	if (samples == NULL || out_buf == NULL || sensor_id >= NIR_SENSOR_COUNT || count == 0 ||
+	    count > BLE_PROTO_BATCH_MAX_SAMPLES) {
 		return 0;
 	}
 
-	/* Red630/Red680/NIR/LED index, 전부 u16 LE (프로토콜 스펙). raw_out 매핑은
-	 * m_i2c_as7341.c에서 이미 640NM=F7(~630nm)/680NM=F8(680nm)/950NM=NIR로 확정. */
-	sys_put_le16(sample->raw[sensor_id][NIRS_WAVELENGTH_640NM], &out_buf[0]);
-	sys_put_le16(sample->raw[sensor_id][NIRS_WAVELENGTH_680NM], &out_buf[2]);
-	sys_put_le16(sample->raw[sensor_id][NIRS_WAVELENGTH_950NM], &out_buf[4]);
-	sys_put_le16(led_index, &out_buf[6]);
+	uint16_t needed_len = BLE_PROTO_BATCH_HEADER_LEN + (count * BLE_PROTO_BATCH_RECORD_LEN);
 
-	return BLE_PROTO_DATA_FRAME_LEN;
+	if (out_buf_cap < needed_len) {
+		return 0;
+	}
+
+	out_buf[0] = (uint8_t)count;
+
+	uint16_t offset = BLE_PROTO_BATCH_HEADER_LEN;
+
+	for (uint16_t i = 0; i < count; i++) {
+		const nirs_sample_t *sample = &samples[i];
+
+		/* v2(2026-09-21)에서 도입한 순서(NCS_TedreamS2 관례 계승) 그대로,
+		 * v3에서는 이 레코드가 배치 헤더 뒤로 여러 개 이어질 뿐이다. */
+		sys_put_le32(sample->timestamp_us, &out_buf[offset]);
+		sys_put_le32(sample->seq_num, &out_buf[offset + 4]);
+
+		/* Red630/Red680/NIR, 전부 u16 LE. raw_out 매핑은 m_i2c_as7341.c에서
+		 * 이미 640NM=F7(~630nm)/680NM=F8(680nm)/950NM=NIR로 확정. */
+		sys_put_le16(sample->raw[sensor_id][NIRS_WAVELENGTH_640NM], &out_buf[offset + 8]);
+		sys_put_le16(sample->raw[sensor_id][NIRS_WAVELENGTH_680NM], &out_buf[offset + 10]);
+		sys_put_le16(sample->raw[sensor_id][NIRS_WAVELENGTH_950NM], &out_buf[offset + 12]);
+
+		offset += BLE_PROTO_BATCH_RECORD_LEN;
+	}
+
+	return offset;
 }
 
 uint16_t m_ble_proto_encode_seq(uint32_t seq_num, uint8_t out_buf[BLE_PROTO_SEQ_FRAME_LEN])

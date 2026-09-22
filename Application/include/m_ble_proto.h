@@ -17,11 +17,32 @@
  *   offset 6-7 : cycle period (u16 LE, ms)
  *   offset 8-9 : active window (u16 LE, ms) — active > cycle이면 cycle로 클램프
  *
- * AS7341_DATA0/DATA1(0x1526/0x1527, notify) — 8바이트 프레임 1개 이상 배칭:
- *   offset 0-1 : Red630 (u16 LE)
- *   offset 2-3 : Red680 (u16 LE)
- *   offset 4-5 : NIR    (u16 LE)
- *   offset 6-7 : LED index (u16 LE)
+ * AS7341_DATA0/DATA1(0x1526/0x1527, notify) — **v3(2026-09-21)**: 배칭 프레임으로 재설계.
+ * 사용자 요청 배경: (1) LED index 필드는 순차 LED 스트로빙이 아직 미구현이라
+ * 매 샘플 고정값 0만 나가는 죽은 필드였음(v2까지) — 제거. (2) 10Hz마다 매번 notify하면
+ * BLE 전력 소모가 커진다는 지적 — 샘플 여러 개를 모아 한 notify로 보내는 배칭 도입.
+ * NCS_TedreamS2 관례(센서 페이로드 = `[timestamp 4B LE][센서 데이터]`)는 v2에서 이미
+ * 계승했고, v3는 그 record를 여러 개 이어붙이는 배치 헤더만 추가한 것이다.
+ *
+ *   offset 0        : sample_count (u8) — 이 프레임에 실린 레코드 개수(1 이상)
+ *   offset 1..       : sample_count개의 14바이트 레코드가 이어짐. 레코드 포맷:
+ *     +0-3 : timestamp_us (u32 LE)
+ *     +4-7 : seq_num (u32 LE) — 부팅 세션 내내 단조증가, 재연결 후 gap 식별용
+ *     +8-9 : Red630 (u16 LE)
+ *     +10-11: Red680 (u16 LE)
+ *     +12-13: NIR    (u16 LE)
+ *
+ * 배치 크기(sample_count)는 고정이 아니라 **협상된 ATT MTU에서 자동 산출**한다
+ * (`m_ble.c` MTU exchange 콜백 참고) — MTU 협상 실패/구버전 중앙기기는 자동으로
+ * sample_count=1(레코드 1개, 15바이트)로 축소되어 별도 레거시 포맷 없이 동일 파서로
+ * 처리된다. DATA0/DATA1은 각자 자기 센서의 레코드만 담아 독립적으로 완전한 프레임을
+ * 유지한다(한쪽 notify가 유실돼도 다른 쪽은 timestamp/seq_num을 그대로 보존).
+ *
+ * 기존 AS7341_SEQ(0x1529) notify characteristic은 **더 이상 notify하지 않는다**
+ * (m_ble.c에서 호출 제거, m_ble_gatt.h 참고) — DATA0/DATA1 레코드 자체에 이미
+ * seq_num이 들어있어 배칭 구조에서는 "같은 tick에 별도 SEQ notify" 개념이 맞지 않게
+ * 됐다. GATT 선언 자체는 하위 호환을 위해 제거하지 않음(구독해도 그냥 아무 것도
+ * 안 오는 것뿐, 비용 없음).
  *
  * TODO(open-item): cycle period/active window는 CONFIG에 저장·read-back은 하지만
  * 아직 RTC 샘플링 주기(config_app.h 고정 100ms/10Hz, Bresenham 보정)에는 반영하지
@@ -59,10 +80,15 @@ extern "C" {
  * notify"와 "가장 최근 DATA0/DATA1 notify"를 같은 샘플로 짝지어서, seq_num
  * 불연속(이전값+1이 아님)이 보이면 그 구간이 "로컬 ring buffer 오버플로우로 유실된
  * 실측 구간"이라고 판단할 수 있다.
+ *
+ * v2(2026-09-21): DATA0/DATA1 프레임에 timestamp_us/seq_num을 직접 포함하도록 확장.
+ * v3(2026-09-21): 배칭 프레임(헤더+가변개수 레코드)으로 재설계, LED index 제거
+ * (위 AS7341_DATA0/DATA1 주석 참고) — 앱이 이 프로토콜 버전을 읽고 파서를 맞춰야 한다.
  */
-#define BLE_PROTOCOL_VERSION 1
+#define BLE_PROTOCOL_VERSION 3
 
-/* SEQ notify 프레임 — seq_num(u32 LE) 그대로. */
+/* SEQ notify 프레임 포맷은 하위 호환을 위해 그대로 둔다 — 실제로 notify하는 코드는
+ * 제거됐다(위 주석 참고, m_ble.c). */
 #define BLE_PROTO_SEQ_FRAME_LEN 4
 
 uint16_t m_ble_proto_encode_seq(uint32_t seq_num, uint8_t out_buf[BLE_PROTO_SEQ_FRAME_LEN]);
@@ -80,15 +106,25 @@ ssize_t m_ble_proto_on_config_write(struct bt_conn *conn, const struct bt_gatt_a
 				     const void *buf, uint16_t len, uint16_t offset,
 				     uint8_t flags);
 
-/* nirs_sample_t 한 개를 DATA0/DATA1 notify 8바이트 프레임으로 인코드한다.
- * sensor_id: NIR_SENSOR_1 -> DATA0, NIR_SENSOR_2 -> DATA1.
- * led_index: 이번 샘플이 어느 LED 점등 중 측정됐는지 (프로토콜 스펙의 LED index 필드).
- */
-#define BLE_PROTO_DATA_FRAME_LEN 8
-#define BLE_PROTO_MAX_PACKET_LEN BLE_PROTO_DATA_FRAME_LEN
+/* 배칭 프레임 레코드/헤더 길이 (위 AS7341_DATA0/DATA1 v3 스펙 참고). */
+#define BLE_PROTO_BATCH_RECORD_LEN 14
+#define BLE_PROTO_BATCH_HEADER_LEN 1
 
-uint16_t m_ble_proto_encode_sample(nir_sensor_id_t sensor_id, const nirs_sample_t *sample,
-				    uint16_t led_index, uint8_t out_buf[BLE_PROTO_MAX_PACKET_LEN]);
+/* MTU 247(ATT payload 244byte, architecture.md §2.4 목표치) 기준 상한 —
+ * (244 - BLE_PROTO_BATCH_HEADER_LEN) / BLE_PROTO_BATCH_RECORD_LEN = 17.
+ * m_ble.c가 실제 협상된 MTU로 이보다 작은 실사용 배치 크기를 매 연결마다 계산한다.
+ */
+#define BLE_PROTO_BATCH_MAX_SAMPLES 17
+#define BLE_PROTO_MAX_PACKET_LEN \
+	(BLE_PROTO_BATCH_HEADER_LEN + (BLE_PROTO_BATCH_MAX_SAMPLES * BLE_PROTO_BATCH_RECORD_LEN))
+
+/* nirs_sample_t 배열(samples[0..count-1])을 DATA0/DATA1 배칭 프레임으로 인코드한다.
+ * sensor_id: NIR_SENSOR_1 -> DATA0, NIR_SENSOR_2 -> DATA1.
+ * count가 BLE_PROTO_BATCH_MAX_SAMPLES를 넘거나 out_buf_cap이 부족하면 0을 반환한다
+ * (호출부가 이미 협상된 배치 크기 이하로 count를 맞추므로 방어적 체크 성격).
+ */
+uint16_t m_ble_proto_encode_batch(nir_sensor_id_t sensor_id, const nirs_sample_t *samples,
+				   uint16_t count, uint8_t *out_buf, uint16_t out_buf_cap);
 
 #ifdef __cplusplus
 }

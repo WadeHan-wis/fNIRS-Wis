@@ -83,14 +83,32 @@ LFCLK → RTC(100ms event) → ISR(timestamp+semaphore만)
 
 ### 2.4 BLE 파라미터 구조 — ✅ S2 계승
 
-- Tx power **-8dBm 고정**, 전 패킷 **32bit us 타임스탬프** — S2 정책 그대로 계승
-- Connection interval은 S2 선례 범위(7.5~30ms) 내에서 실시간성/배터리 트레이드오프를 실측 후 확정
-- MTU는 BLE 5.0 Extended Length 기준 최대 251byte를 목표로 협상, 실패 시 기본 23byte로 폴백하는 경로도 구현
-- Batch size는 패킷헤더+3파장raw+seq+timestamp(샘플당 약 16~20byte) 기준, 협상된 MTU 페이로드 안에 들어가는 최대 샘플 수를 역산해 결정 (예: payload 244byte 기준 약 12~15샘플/패킷) — 정확한 실측치는 Rev2 착수 시 확정
+- Tx power **-8dBm 고정** — 여전히 미착수(TODO, m_ble.c).
+- 전 패킷 **32bit us 타임스탬프** — S2 정책 그대로 계승, DATA0/DATA1 배칭 프레임에 실제 적용됨(v2, CHANGELOG v0.1.18).
+- **Connection interval/peripheral latency — 2026-09-21 초기값 적용**(CHANGELOG v0.1.19,
+  사용자 요청): 30ms interval, latency 4(유휴 시 연결 이벤트 4/5 스킵)로
+  `bt_conn_le_param_update()` 요청. S2 선례 범위(7.5~30ms) 내 값이나, 여전히 **초기값**
+  — 중앙기기가 거부/재협상 가능하고 실측(AT-06 전류소비 검증) 후 조정 필요.
+- **MTU 협상 — 2026-09-21 구현 완료**(CHANGELOG v0.1.19): `bt_gatt_exchange_mtu()`로
+  peripheral이 선제 요청, 목표 247(payload 244), 실패 시 배치 크기 1(=사실상 폴백)로
+  자동 축소 — 별도 레거시 프레임 없이 동일 파서로 처리(m_ble_proto.h v3 스펙).
+  LE Data Length Update도 함께 요청(`bt_conn_le_data_len_update()`) — 컨트롤러는 이미
+  251byte까지 지원하도록 기본 설정돼 있었음(빌드 `.config`로 확인).
+- **Batch size — 2026-09-21 구현 완료**: 원안 추정(샘플당 16~20byte, payload 244byte
+  기준 약 12~15샘플/패킷)과 실제로 거의 일치 — LED index 제거로 샘플당 14byte가 되어
+  상한 17샘플/패킷(`BLE_PROTO_BATCH_MAX_SAMPLES`)로 계산됨. 협상된 MTU에서 매 연결마다
+  자동 산출(`m_ble.c` MTU exchange 콜백), 고정값이 아님.
 
 ### 2.5 Ring Buffer / Flash Logging 구조 — ✅ S2 계승
 
-- Ring buffer 크기: 10Hz 기준 BLE 지연 5~10초를 버틸 수 있는 50~100샘플에 안전마진을 더해 **100~200샘플**로 설계
+- Ring buffer 크기: 10Hz 기준 BLE 지연 5~10초를 버틸 수 있는 50~100샘플에 안전마진을 더해 **100~200샘플**로 설계(원안).
+  **2026-09-21 정정**: 이 원안은 BLE notify 지연/혼잡만 고려한 값이었는데, 이후 §11
+  항목6-[3]에서 "연결 끊겨도 30초는 계속 측정+버퍼링"이 추가되면서 두 설계가 서로
+  검토 없이 따로 갔다 — 150샘플(15초 분량)로는 30초의 절반도 못 버텨서 실제로는 앞부분
+  데이터가 유실되고 있었다(`config_app.h`, CHANGELOG v0.1.17). `RING_BUFFER_CAPACITY`를
+  `BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS`에 직접 묶어 재발을 방지했고, RAM 예산(nRF52832
+  64KB) 여유가 30초 전량을 못 담아서(96%까지 치솟음) grace period 자체를 **22초로
+  단축**(사용자 결정) — 결과 RAM 91.67% 사용, 현재 `RING_BUFFER_CAPACITY`=220샘플.
 - Flash logging은 초기 버전(Rev0~3)에서는 별도 구현하지 않음 — overflow 발생 시 §4 원칙대로 counter/flag만 기록. S2에 이미 구현된 로깅 방식이 있다면 Rev2 착수 시 소스 재확인 후 재사용 여부 결정
 
 ---
@@ -260,6 +278,14 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
        (`m_ctrl_is_safe_state()`, `m_i2c.c` tick 루프에서 체크 — CHANGELOG v0.0.14 §1).
        래치 방식(자동복구 없음, 재부팅으로만 해제) — IEC 60601 단일고장 안전 철학에 따른
        의도적 설계 결정.
+       **버그 수정(2026-09-21, CHANGELOG v0.1.18)**: 이 래치가 진짜 고장이 아닌 상황에서
+       오발동할 뻔했다 — 재연결 후 ring buffer backlog(§11 항목6-[3], 최대 220샘플)를
+       텀 없이 몰아서 notify하면 BLE ATT 송신 버퍼 풀이 고갈되어 `bt_gatt_notify()`가
+       일시적 혼잡(`-ENOMEM`)을 반환할 수 있는데, `m_ble.c`가 이를 진짜 통신 장애로
+       오분류해 `MODULE_ERR_BLE_TX_FAILED`를 보고 → `CTRL_STATE_DEGRADED` 래치 →
+       재부팅 전까지 측정 영구 정지. `-ENOTCONN`/`-EINVAL`과 같은 "무해한 전달 실패"로
+       재분류하고 congestion 감지 시 짧게 backoff하도록 수정. 하드웨어 검증 필요(실물
+       backlog flush에서 `-ENOMEM`이 실제로 재현되는지, 래치 없이 정상 flush되는지).
      - Watchdog 리셋 후 안전 재시작 시퀀스 — **2026-09-17 실기 검증 완료** (`m_ctrl.c
        log_reset_cause()`가 RESETREAS로 watchdog 리셋 여부를 로그 — CHANGELOG v0.0.14 §2).
        `TEMP_WATCHDOG_FAULT_INJECT_TEST`로 m_i2c 태스크를 고의로 hang시켜 실기로
@@ -282,6 +308,13 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
        불안정(9/17 watchdog 검증 때와 동일한 문제)으로 RTT 캡처 자체가 너무 힘들어서
        2026-09-18에 다음으로 연기하기로 결정** — 코드/로그는 준비된 상태이니 SWD 환경이
        안정적일 때 재시도.
+       **2026-09-21 재확정(사용자 결정)**: PoC v1 보드의 SWD 접촉 불안정은 이번 리비전에서
+       근본 해결이 어려운 하드웨어 이슈로 판단, **PoC v2 보드로 SWD 환경이 개선된 뒤 재시도
+       하기로 함** — 이번 주(9/21~23) 작업 범위에서 제외. 코드/로그(v0.1.10)는 그대로
+       유효하므로 PoC v2 입수 후 바로 재시도 가능.
+       **2026-09-21 값 변경(CHANGELOG v0.1.17)**: `BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS`가
+       ring buffer RAM 예산 재검토로 30초→**22초**로 바뀌었다 — 위 실기 검증(SWD 안정화 후
+       재시도) 시 30초가 아니라 22초 기준으로 STANDBY 진입 시점을 확인해야 한다.
      - 배터리 저전압/완전방전 시 안전 셧다운 — **HW 제약으로 구현 불가** (배터리 IC 부재,
        "배터리 전압/잔량 센싱 경로 부재" 항목과 동일 원인, 그대로 보류)
      - 충전 중 착용 시나리오 정의·구현 — 그대로 보류 (오늘 범위 제외, 사용자 확정)
@@ -289,10 +322,14 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
    - **경보 시스템 (IEC 60601-1-8 연계)**: 저배터리 경보(HW 제약)/BLE 연결끊김 경보/경보
      로깅 3건 — **오늘 범위에서 제외**(사용자 확정, HW 제약 4건과 함께 보류 유지)
    - **데이터 무결성 및 필수성능 보호**
-     - CRC/체크섬 — **wire 프레임(DATA0/DATA1) 추가는 보류로 결정**. 8바이트 고정
-       프레임(테스트 APK 하드코딩)에 여유가 없어, 앱 프로토콜 갱신 없이는 추가 불가능.
-       BLE 링크레이어가 모든 패킷에 CRC24를 이미 적용하므로(Bluetooth Core Spec, 전송
-       구간 무결성은 기존에 확보됨) 앱 레이어 CRC는 추가 프로토콜 버전에서 재검토.
+     - CRC/체크섬 — **wire 프레임(DATA0/DATA1) 추가는 보류로 결정**(당시 근거: 8바이트
+       고정 프레임에 여유가 없어 앱 프로토콜 갱신 없이는 추가 불가능). BLE 링크레이어가
+       모든 패킷에 CRC24를 이미 적용하므로(Bluetooth Core Spec, 전송 구간 무결성은
+       기존에 확보됨) 앱 레이어 CRC는 추가 프로토콜 버전에서 재검토.
+       **2026-09-21 참고**: 프레임이 v2(16바이트, 아래 재연결 후 gap 식별 항목 참고)로
+       확장되면서 "8바이트라 여유 없다"는 전제 자체는 더 이상 유효하지 않다 — CRC 추가가
+       다시 필요해지면 이번에 이미 앱 프로토콜을 갱신했으므로 재검토 부담이 줄었다.
+       다만 CRC 자체를 요청받은 적은 없어 이번 범위에는 포함하지 않음.
      - 센서 raw 값 물리적 sanity check — **코드 작성 완료**(`m_i2c.c
        check_sensor_sanity()`가 기존 미사용 상태였던 `MODULE_ERR_SENSOR_SATURATION`/
        `LOW_SIGNAL`을 실제로 판정 — CHANGELOG v0.0.14 §4). 임계값은 보수적 고정값
@@ -325,6 +362,22 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
        전달 실패"를 구분하지 못한다 — 둘 다 앱 입장에서는 seq_num 불연속으로 동일하게
        보인다. 더 정확한 구분이 필요해지면 DATA0/DATA1 notify 자체도 실패했는지
        상호 대조하거나, Indication(ACK 필요)으로 전환하는 방안을 검토한다(TODO).
+       **근본 해결(2026-09-21, CHANGELOG v0.1.18)**: DATA0/DATA1 프레임 자체를 8→16바이트로
+       확장해 timestamp_us(u32 LE)/seq_num(u32 LE)을 직접 포함(NCS_TedreamS2 관례 계승,
+       `m_ble_proto.h` 프로토콜 스펙 참고) — 위에서 "비권장"이라 했던 프레임 변경을
+       사용자 결정으로 결국 진행했다(앱을 함께 관리하므로 호환성 부담을 사용자가
+       직접 감수). 이제 DATA0/DATA1 notify 자체에 seq_num이 있어 SEQ 스트림과 별도로
+       대조할 필요가 없어졌지만, 위에서 설명한 "notify 자체의 무해한 전달 실패" 한계
+       (ACK 없는 fire-and-forget)는 프레임 확장과 무관하게 그대로 남아있다 — DATA0/DATA1
+       notify 하나가 유실되면 그 샘플의 seq_num도 함께 유실되므로, 여전히 "ring buffer
+       overflow로 인한 진짜 gap"과 "notify 전달 실패"를 앱이 자체적으로 구분하려면
+       `AS7341_DROPPED_COUNT`(아래) 대조가 필요하다. `AS7341_SEQ`(0x1529)는 하위 호환을
+       위해 제거하지 않고 유지.
+       **v3 배칭(2026-09-21, CHANGELOG v0.1.19)**: DATA0/DATA1이 다시 배칭 프레임
+       (`[count][record×N]`)으로 바뀌면서 "notify 하나 유실 = 그 안의 여러 샘플이
+       한꺼번에 유실"로 위험 단위가 커졌다(최대 17샘플/notify) — 배칭 도입의 트레이드
+       오프로 인지해야 함. 이 변경으로 `AS7341_SEQ` notify 호출 자체는 중단(레코드에
+       이미 seq_num이 있어 중복) — characteristic 선언은 유지.
        **인프라 추가(2026-09-18, FW 단독)**: `m_i2c_ring_buffer_get_dropped_count()`가
        구현만 되고 아무도 호출하지 않던 상태였음을 발견 — AS7341_DROPPED_COUNT(0x152A,
        read-only, u32 LE) characteristic으로 노출했다(VERSION/SEQ와 동일한 순수 추가
@@ -335,15 +388,28 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
    - **무선통신 및 보안 (14.13 IT-네트워크 요구사항)**
      - BLE 페어링/본딩·암호화 — **설계만 준비, 비활성 상태로 커밋**(`prj.conf`에
        `CONFIG_BT_SMP`/`BONDABLE` 주석 처리). 활성화 시 `m_ble_gatt.c`의 CONFIG/DATA0/
-       DATA1 permission을 encrypt-required로 바꿔야 실제 암호화가 강제된다. **활성화
+       DATA1 permission을 encrypt-required로 바꿔야 실제로 암호화가 강제된다. **활성화
        조건**: 테스트 APK가 본딩을 지원하는지 확인 후 — 미확인 상태에서 켜면 이미
        검증된 연동(v0.0.12)이 깨질 위험이 있어 사용자가 오늘 범위에서 보류하기로 확정.
+       **2026-09-21 경과**: 같은 날 한 차례 활성화했다가(v0.1.15) 사용자 재확인 결과
+       "지금 단계에서는 필요 없다, 끊긴 뒤 advertising 재개로 재연결만 되면 충분하다"는
+       판단으로 즉시 롤백(v0.1.16) — 그 재연결 동작은 본딩과 무관하게 기존 구조
+       (`m_ble.c on_disconnected()`)로 이미 충족되고 있었다. 본딩은 다시 보류 상태로
+       복귀, 앱 본딩 지원 확인이라는 원래 활성화 조건도 그대로 유효하다.
      - 통신 프로토콜 버전 관리 — **버전 노출만 구현, 협상/거부 로직은 인프라 없음**.
        AS7341_VERSION characteristic(0x1528, read-only) 신규 추가로 `fw_version`+
        `protocol_version`(`BLE_PROTOCOL_VERSION=1`)을 읽을 수 있게 함(순수 추가, 기존
        characteristic 호환성 영향 없음). 구버전 거부/호환모드는 앱이 이 값을 읽고
        대응하도록 업데이트돼야 실효성이 생기며, 테스트 APK는 이 characteristic 자체를
        모른다 — 앱 갱신 전까지는 "읽을 수 있다"는 인프라 단계.
+       **2026-09-21(CHANGELOG v0.1.18)**: `BLE_PROTOCOL_VERSION` 1→2 — DATA0/DATA1
+       프레임이 8→16바이트로 바뀌면서(위 "재연결 후 데이터 gap 식별" 항목 참고) 처음으로
+       이 버전 값이 실제로 의미를 갖게 됐다. 다만 구버전 거부/협상 로직은 여전히 인프라
+       없음 상태 그대로 — 앱이 이 프레임 길이 변경에 맞춰 파서를 업데이트해야 한다.
+       **2026-09-21(같은 날, CHANGELOG v0.1.19)**: 배칭 도입으로 `BLE_PROTOCOL_VERSION`
+       2→3 — DATA0/DATA1이 고정 16바이트에서 `[count][record×N]` 가변 길이 배칭
+       프레임으로 다시 바뀌었다(§2.4/§2.5, m_ble_proto.h v3 스펙). 앱이 또 한 번
+       파서를 업데이트해야 한다.
    - **형상관리 및 식별**
      - 펌웨어 버전 식별 기능 — **정정(2026-09-17)**: 이전에 "구현 완료(매 샘플에 포함되어
        앱에 전달됨)"로 잘못 기록했다. 실제로는 `fw_version`이 `nirs_sample_t`에만
@@ -409,6 +475,16 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
    그대로 유지한다 — 짧은 끊김에도 데이터 유실을 막기 위한 의도된 설계이므로 앱의
    재연결 지연을 이유로 되돌리지 않는다. TODO(open-item): 테스트 APK에 BLE 자동
    재연결 로직 추가 필요(앱 쪽 작업, 펌웨어 범위 아님).
+   **해결(2026-09-21, 앱 쪽 검증 완료)**: 사용자가 앱에 "disconnect 이벤트 감지 시
+   자동 reconnecting 대기" 로직을 구현. 1차로 디바이스 전원을 꺼서 강제로 연결을 끊은
+   뒤 전원을 다시 켜서 앱이 자동 재연동하는 것을 확인 — 이건 펌웨어의 두 advertising
+   재시작 경로 중 부팅 시 경로(`m_ble.c ble_init()` → `start_advertising()`)만 검증한
+   것이었다. **이후 휴대폰 BT 토글로 디바이스는 켜둔 채 BLE 링크만 끊는 런타임
+   경로(`on_disconnected()` → `s_adv_restart_work`)도 추가 검증 완료** — 두 경로 모두
+   앱 자동 재연결이 정상 동작함을 확인, 이 항목 완전 해소.
+   **grace period 값 변경 참고(2026-09-21, CHANGELOG v0.1.17)**: 위 문단의 "30초"는
+   당시 기준이고, RAM 예산 재검토로 현재는 **22초**(`BLE_DISCONNECT_STANDBY_TIMEOUT_
+   TICKS=220`)로 바뀌었다.
 
 ### 다음 보드 리비전 반영 예정 (하드웨어 개선 항목, 확정됨 — 일정만 대기)
 - **LED3 파장 부품 교체**: 스펙(§0/§5/§9)은 950nm이나, PoC v1 보드(`SCH_fNIRS_Sleep_Project.pdf`) 실장 부품은

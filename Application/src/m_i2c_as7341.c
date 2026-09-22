@@ -140,6 +140,20 @@ module_err_t m_i2c_as7341_init(m_i2c_as7341_dev_t *dev, const struct device *i2c
 
 	LOG_INF("AS7341(%s) SMUX 구성 성공 — init 완료", dev->i2c_dev->name);
 
+	/* SP_EN(스펙트럴 엔진)은 init 시 1회만 켜고 이후 절대 재기록하지 않는다 — datasheet가
+	 * free-running(SPM) 모드로 문서화하는 대로, SMUX 구성 이후 계속 켜둔 채로 두면 센서가
+	 * 백그라운드에서 끊김 없이 연속 적분한다. _ref_fnirs_example(같은 AS7341 3파장
+	 * F7/F8/NIR 구성을 실사용 검증한 레퍼런스, src/as7341.c as7341_init_device())도 이
+	 * 방식이다 — 매 읽기마다 ENABLE을 다시 쓰지 않는다. m_i2c_as7341_read_raw()가 매
+	 * tick마다 이 레지스터를 재기록하던 이전 방식은 architecture.md §11 항목5의 미해결
+	 * 우려사항("LED on 구간과 실제 적분 구간이 정확히 일치한다는 보장 없음")과도 연결돼
+	 * 있었음 — 불필요한 재기록 자체를 제거해 레퍼런스와 동일한 free-running 방식으로 정정.
+	 */
+	err = as7341_reg_write(dev, AS7341_REG_ENABLE, AS7341_ENABLE_PON | AS7341_ENABLE_SP_EN);
+	if (err != 0) {
+		return MODULE_ERR_I2C_TIMEOUT;
+	}
+
 	dev->initialized = true;
 	return MODULE_ERR_OK;
 }
@@ -156,21 +170,41 @@ module_err_t m_i2c_as7341_set_gain(m_i2c_as7341_dev_t *dev, uint16_t gain)
 }
 
 module_err_t m_i2c_as7341_set_integration_time(m_i2c_as7341_dev_t *dev,
-						 uint16_t integration_time)
+						 uint8_t integration_20ms_units)
 {
 	/* integration time = (ATIME+1) * (ASTEP+1) * 2.78us.
-	 * 우선 ASTEP는 고정(999, 약 2.78ms 기준 step)하고 ATIME만 파라미터로 받는다.
-	 * TODO(open-item): 실측 후 ATIME/ASTEP 조합을 채널별 saturation 기준으로 재확정.
+	 * _ref_fnirs_example(src/as7341.c as7341_set_integration_20ms_device())와 동일하게
+	 * ATIME=AS7341_ATIME_FIXED(99)로 고정하고 ASTEP만 목표 적분시간(20ms 단위, BLE
+	 * AS7341_CONFIG 필드와 동일 단위)에 맞춰 계산한다 — 이전에는 반대로 ASTEP를
+	 * 고정하고 ATIME을 가변으로 뒀었는데(등가이나 레퍼런스와 파라미터화 방향이 달랐음),
+	 * "레퍼런스와 동일 세팅" 목표로 2026-09-21 정정. 단위 0은 레퍼런스처럼 최소 1로
+	 * 클램프한다.
 	 */
-	int err = as7341_reg_write(dev, AS7341_REG_ATIME, (uint8_t)(integration_time & 0xFF));
+	if (integration_20ms_units == 0) {
+		integration_20ms_units = 1;
+	}
+
+	uint32_t astep_plus_one = ((uint32_t)integration_20ms_units * 20000U) / 278U;
+
+	if (astep_plus_one == 0) {
+		astep_plus_one = 1;
+	}
+
+	uint32_t astep = astep_plus_one - 1;
+
+	if (astep > 0xFFFF) {
+		astep = 0xFFFF;
+	}
+
+	int err = as7341_reg_write(dev, AS7341_REG_ATIME, AS7341_ATIME_FIXED);
 
 	if (err != 0) {
 		return MODULE_ERR_I2C_TIMEOUT;
 	}
 
-	err = as7341_reg_write(dev, AS7341_REG_ASTEP_L, 0xE7); /* 999 & 0xFF */
+	err = as7341_reg_write(dev, AS7341_REG_ASTEP_L, (uint8_t)(astep & 0xFF));
 	if (err == 0) {
-		err = as7341_reg_write(dev, AS7341_REG_ASTEP_H, 0x03); /* 999 >> 8 */
+		err = as7341_reg_write(dev, AS7341_REG_ASTEP_H, (uint8_t)((astep >> 8) & 0xFF));
 	}
 
 	return (err == 0) ? MODULE_ERR_OK : MODULE_ERR_I2C_TIMEOUT;
@@ -186,13 +220,10 @@ module_err_t m_i2c_as7341_read_raw(m_i2c_as7341_dev_t *dev, uint16_t raw_out[NIR
 		return MODULE_ERR_NOT_INITIALIZED;
 	}
 
-	int err = as7341_reg_write(dev, AS7341_REG_ENABLE,
-				    AS7341_ENABLE_PON | AS7341_ENABLE_SP_EN);
-	if (err != 0) {
-		return MODULE_ERR_I2C_TIMEOUT;
-	}
-
+	/* SP_EN은 init에서 1회만 켜고 여기서는 절대 재기록하지 않는다(위 m_i2c_as7341_init()
+	 * 주석 참고) — STATUS2.AVALID 폴링 + 채널 읽기만 수행한다. */
 	bool valid = false;
+	int err;
 
 	for (int i = 0; i < AS7341_MEASURE_TIMEOUT_MS; i++) {
 		uint8_t status2 = 0;

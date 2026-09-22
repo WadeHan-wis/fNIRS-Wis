@@ -538,3 +538,243 @@
   안정성 문제가 근본 원인이라 오늘은 검증을 보류. v0.1.10에서 추가한 로그는 그대로
   유효하니 SWD 환경이 안정적일 때 재시도하면 됨. architecture.md §11 항목6-[2]/[3]에
   연기 사유 기록.
+
+## v0.1.12 (2026-09-21)
+
+- **[버그 수정] AS7341 SP_EN(스펙트럴 엔진)을 매 tick마다 재기록하던 것을 init 시
+  1회만 켜도록 정정** — `_ref_fnirs_example`(같은 AS7341 3파장 F7/F8/NIR 구성을 실사용
+  검증한 레퍼런스, `src/as7341.c`)과 측정 방식을 대조하는 과정에서 발견. 레퍼런스는
+  `as7341_init_device()`에서 SMUX 구성 직후 SP_EN을 1회만 켜고 이후 주기적 읽기
+  (`as7341_read_current_mux_channels_device()`)에서는 STATUS2.AVALID 폴링과 채널
+  읽기만 하고 ENABLE 레지스터를 다시 건드리지 않는다(datasheet가 문서화하는
+  free-running SPM 모드 그대로). 우리 `m_i2c_as7341_read_raw()`는 매 호출(매 tick)마다
+  `ENABLE=PON|SP_EN`을 재기록하고 있었음 — architecture.md §11 항목5의 미해결 우려사항
+  ("SP_EN을 매 tick마다 재기록하지만 free-running 모드라 LED on 구간과 실제 적분 구간이
+  정확히 일치한다는 보장이 없음", v0.0.10 기록)과 직결되는 부분. `m_i2c_as7341_init()`에
+  SMUX 구성 성공 직후 SP_EN 1회 활성화를 추가하고, `read_raw()`의 재기록 코드는 제거해
+  레퍼런스와 동일한 free-running 방식으로 정정. 불필요한 I2C 쓰기 1회/tick도 함께
+  줄어듦(v0.0.10 기록된 NIR1+NIR2 순차 최악 400ms 폴링 부담에 소폭 도움).
+- **[대조 결과] SMUX RAM 20바이트 설정값은 레퍼런스와 완전히 일치함을 확인** —
+  `m_i2c_as7341.c`의 `s_smux_config_f5f8_clear_nir[20]`과 레퍼런스
+  `as7341_setup_f5f8_clear_nir()`의 20바이트 값이 레지스터 0x00~0x13 전부 동일. 기존
+  TODO(open-item, architecture.md §11 항목5 "공개 레퍼런스 구현 값을 우선 적용, ams 공식
+  앱노트 교차검증 필요")의 교차검증 근거 하나가 추가로 확보됨(정식 앱노트 대조는 아니지만
+  독립적인 실사용 레퍼런스와 값이 일치).
+- **[구조적 차이, 패치 대상 아님] LED 구동 방식은 레퍼런스와 동일하지 않으나 하드웨어
+  토폴로지 자체가 다름** — 레퍼런스는 RED/IR 2채널 LED를 2개 물리 위치(location)에
+  배치해 놓고 위치 전환 타이머로 순환하며, LED는 BLE CONFIG로 받은 intensity로
+  **계측 타이밍과 무관하게 상시 점등**(강도 제어만, 스트로빙 없음). 반면 이 프로젝트는
+  640/680/950nm 3파장 LED가 한 위치에 개별 실장돼 있고(pinmap.md §3), 테스트 APK
+  프로토콜(디컴파일 확인, CHANGELOG v0.0.11)이 요구하는 파장별 duty + cycle/active
+  게이팅(v0.1.5)을 그대로 유지해야 함 — 레퍼런스의 "상시 점등" 방식을 이 프로젝트에
+  그대로 옮기면 기존 검증된 APK 연동(CONFIG write→LED 제어)이 깨진다. 레퍼런스와
+  구조가 다른 것이 확인된 것이지 버그가 아니므로 패치하지 않음.
+
+## v0.1.13 (2026-09-21)
+
+- **[정책 반영] AS7341 적분시간 파라미터화를 레퍼런스와 동일한 방식으로 정정** — 논문
+  (Ban et al., §11 항목5) 재현 가능한 장비를 먼저 만들고 그 위에서 성능을 올리기로
+  한 사용자 결정에 따라, "레퍼런스와 동일 세팅"을 우선 적용. 기존에는 ASTEP=999
+  고정 + ATIME 가변(물리적으로 등가이나 레퍼런스와 반대 방향)이었던 것을,
+  `_ref_fnirs_example`(src/as7341.c `as7341_set_integration_20ms_device()`)과 동일하게
+  **ATIME=99(`AS7341_ATIME_FIXED`) 고정 + ASTEP 가변**으로 변경(`m_i2c_as7341.c/.h`).
+  `m_i2c_as7341_set_integration_time()`의 파라미터 의미가 "ATIME 레지스터값"에서
+  "integration_20ms_units"(BLE AS7341_CONFIG 필드와 동일 단위, 레퍼런스와 동일 semantics)로
+  바뀌었다 — `m_i2c.c apply_pending_ble_config()`의 별도 단위 변환 코드
+  (`integration_units_to_atime()`)도 더 이상 필요 없어 삭제.
+- **[기본값 변경, 실기 재검증 필요]** 부팅 시 기본 적분시간을 기존 83.4ms(ATIME=29/
+  ASTEP=999)에서 레퍼런스 기본값과 동일한 **약 19.7ms**(units=1, ATIME=99/ASTEP=70,
+  `_ref_fnirs_example`의 `AS7341_DEFAULT_INTEGRATION_20MS=1`과 동일)로 변경. gain=9(256x)는
+  그대로 유지(레퍼런스도 CFG1 리셋 기본값이 동일하게 9). 83.4ms는 2026-09-15 실기에서
+  "6채널 모두 안정적인 비영 값" 확인된 값이었으므로, 19.7ms로 짧아진 이번 기본값에서도
+  신호가 노이즈 수준으로 떨어지지 않는지 **다음 실기 검증에서 재확인 필요**(TODO
+  open-item, architecture.md §11 항목5의 gain/ATIME 실측 캘리브레이션과 함께 처리 예정).
+- **빌드 검증 완료** — `west build -b nrf52dk/nrf52832 Application -p always`(VERSION 파일
+  변경 반영을 위해 pristine 필요, v0.0.16과 동일 이슈) clean build 성공. FLASH 156796B/
+  216752B(72.34%), RAM 57584B/64KB(87.87%, 기존 v0.0.15 대비 RAM 사용량이 늘어난 것은
+  이번 변경이 아니라 그 사이 추가된 BLE/OTA 버퍼 설정 누적분). `dfu_application.zip`
+  manifest 확인 결과 `version_MCUBOOT: "0.1.13+0"` 정상 반영. **하드웨어 검증은 미실시**
+  (이 세션 환경엔 실물 보드/J-Link 연결이 없음) — `west flash`로 실기 플래시 후 raw 데이터
+  질적 변화(19.7ms 적분시간에서도 노이즈 수준으로 안 떨어지는지) 확인 필요.
+
+## v0.1.14 (2026-09-21)
+
+- **[버그 수정, 고위험(Watchdog/Reset)] v0.1.13 플래시 후 보드가 부팅 중 재부팅되는 현상
+  — 원인: 버전 점멸 LED 블로킹 구간에서 watchdog stale 오탐**. 사용자가 "이번 패치 이후
+  리셋되는 것 같다"고 보고, 버전 점멸 LED를 원인으로 의심해 조사 요청.
+  - `m_ctrl.c watchdog_init()`은 CTRL 태스크 시작 즉시(부팅 초반) watchdog을 무장한다
+    (`WATCHDOG_TIMEOUT_MS=4000ms`). `feed_watchdog_if_alive()`는 I2C/BLE 두 소스 모두
+    최근 `WATCHDOG_ALIVE_STALE_MS(1000ms)` 이내에 `m_ctrl_notify_alive()`를 호출했어야 feed.
+  - `m_i2c.c i2c_init()`의 버전 점멸 루프(`FW_VERSION_BOOT_BLINK_MS=150ms` × 2 ×
+    `(FW_VERSION_PATCH+1)`회)는 **블로킹**인데, I2C 태스크의 첫 `m_ctrl_notify_alive
+    (CTRL_ALIVE_I2C)` 호출은 이 루프가 끝나고 RTC tick 메인루프에 들어가야만 발생한다.
+    v0.1.13(PATCH=13) 기준 점멸 시간이 **14×300ms=4200ms**로 watchdog 타임아웃(4000ms)을
+    이미 초과 — `FW_VERSION_PATCH`가 매 패치(CHANGELOG 규칙상 무조건 +1)마다 늘어나므로
+    이전부터 존재하던 시한폭탄이 이번 버전에서 실제로 터진 것(v0.1.11=3600ms, v0.1.12=
+    3900ms로 이미 여유가 거의 없었음).
+  - 추가로 `m_ble.c ble_init()`이 `k_sem_take(&sem_i2c_init_done, K_FOREVER)`로 I2C 초기화
+    완료를 기다리는 동안 BLE의 첫 alive 신호도 함께 지연돼, 부팅 초반 **두 소스가 동시에
+    stale**해지는 구조였다(둘 다 필요조건이라 하나만 고쳐도 근본 해결이 안 됨).
+  - **수정**: ①`m_i2c.c` 점멸 루프 매 반복 + AS7341 init 완료 직후에 `m_ctrl_notify_alive
+    (CTRL_ALIVE_I2C)` 추가. ②`m_ble.c`의 `K_FOREVER` 대기를 `K_MSEC(200)` 타임아웃 반복
+    폴링으로 변경, 대기 중에도 매번 `m_ctrl_notify_alive(CTRL_ALIVE_BLE)` 호출. 둘 다 정상
+    대기/초기화 구간에서만 alive를 더 자주 보고하는 추가적 변경이라, 실제 I2C 버스 행/BLE
+    스택 초기화 실패 등 **진짜 hang은 여전히 감지**한다(watchdog 보호 기능 약화 없음).
+  - **빌드 검증 완료**: clean pristine rebuild 성공, `version_MCUBOOT: "0.1.14+0"` 확인.
+    **하드웨어 검증 필요**(실기에서 부팅 후 재부팅 없이 정상 진행되는지 RTT로 확인) — 이
+    세션 환경에는 실물 보드 없음.
+  - TODO(open-item): `FW_VERSION_PATCH`가 계속 늘어나면 버전 점멸 시간 자체는 계속
+    길어진다(현재 v0.1.14 기준 15×300ms=4500ms) — watchdog stale 문제는 해소했지만, 부팅
+    체감 시간이 계속 늘어나는 것은 별개 이슈. 점멸 횟수를 `FW_VERSION_PATCH % N` 등으로
+    캡하는 것을 다음에 검토 필요(architecture.md §11 후보 등록 권장).
+
+## v0.1.15 (2026-09-21, **롤백됨 — 아래 v0.1.16 참고**)
+
+- **[신규, 고위험(보안), 같은 날 v0.1.16에서 롤백됨] BLE 페어링/본딩 활성화 — architecture.md §11 항목6-[5]에 설계만
+  준비돼 있던 것을 사용자 결정으로 활성화(펌웨어 먼저 구현 후 앱에 적용 예정)**.
+  - `prj.conf`: `CONFIG_BT_SMP=y`/`CONFIG_BT_BONDABLE=y` 활성화. 재부팅 후에도 "자동
+    재연결"이 유지되도록 본딩 정보(LTK)를 flash(NVS)에 영구 저장하는
+    `CONFIG_BT_SETTINGS`/`CONFIG_SETTINGS`/`CONFIG_NVS`/`CONFIG_FLASH_MAP` 계열 신규 추가.
+  - `m_ble_gatt.c`: `CONFIG` characteristic read/write, `DATA0`/`DATA1`의 CCC descriptor
+    permission을 `BT_GATT_PERM_*_ENCRYPT`로 변경 — 본딩(암호화)되지 않은 연결은 CONFIG
+    접근/DATA0·DATA1 구독이 거부된다.
+  - `m_ble.c`: `on_connected()`에서 연결 즉시 `bt_conn_set_security(conn, BT_SECURITY_L2)`
+    호출로 본딩을 선제적으로 트리거(앱이 characteristic에 접근할 때까지 기다리지 않음).
+    `bt_conn_auth_cb`/`bt_conn_auth_info_cb` 등록, `security_changed` 콜백 추가(결과 로깅).
+    `bt_enable()` 이후 `settings_load()` 호출로 이전 세션의 본딩 정보 복원.
+  - **IO capability 결정**: 이 보드는 디스플레이/입력 수단이 전혀 없어(pinmap.md)
+    passkey/confirm 콜백을 등록하지 않았다 — Zephyr가 자동으로 NoInputNoOutput으로
+    취급해 **Just Works 페어링만 수행**(MITM 인증 불가, 하드웨어 구조상 불가피).
+  - **부수 효과**: `CONFIG_BT_SMP=y`로 `CONFIG_NCS_SAMPLE_MCUMGR_BT_OTA_DFU`의
+    `MCUMGR_TRANSPORT_BT_PERM`도 암호화 필요 옵션으로 자동 전환됨 — OTA(SMP)도 이제
+    본딩된 연결에서만 가능해진다(기존 OTA 검증, CHANGELOG v0.0.17 이하는 비암호화
+    기준이었으므로 재검증 필요).
+  - **빌드 검증 완료**: clean pristine rebuild(`west build -b nrf52dk/nrf52832 Application
+    -p always`) 성공, `dfu_application.zip` manifest `version_MCUBOOT: "0.1.15+0"` 확인.
+  - **미검증 상태**: 테스트 APK가 BLE 페어링 UI/본딩을 지원하는지 이 세션에서 확인하지
+    못했다 — 지원하지 않으면 기존 앱 연동(v0.0.12 검증분)이 CONFIG/DATA0/DATA1에서 깨질
+    수 있다. **하드웨어 검증(실제 페어링 시퀀스, 재부팅 후 재페어링 없이 재연결)은 이
+    세션에 실물 보드가 없어 미실시**.
+  - TODO(open-item): 앱 쪽 본딩 지원 확인 및 대응 완료 후, OTA(SMP) 재검증 필요.
+
+## v0.1.16 (2026-09-21)
+
+- **[롤백] v0.1.15 BLE 페어링/본딩 전면 롤백 — 사용자 결정**: "본딩 로직은 롤백해줘,
+  아직은 구현할 필요가 없을 것 같다 — 앱과 연동이 끊어진 후 디바이스가 다시 advertising
+  으로 전환되서 재연결만 되면 충분하다"는 판단. 그 재연결 동작은 v0.1.15 이전부터
+  `m_ble.c on_disconnected()`가 이미 담당하고 있어(연결 해제 시 advertising 재시작,
+  2026-09-16 검증 완료) 별도 구현이 필요 없었다.
+  - `prj.conf`: `CONFIG_BT_SMP`/`BONDABLE`/`SETTINGS`/`NVS`/`FLASH_MAP` 계열 전부 원복,
+    항목6-[5] 주석을 "설계만 준비, 비활성" 원래 상태로 되돌리되 2026-09-21 활성화→롤백
+    이력만 짧게 추가.
+  - `m_ble_gatt.c`: CONFIG characteristic, DATA0/DATA1 CCC permission을
+    `BT_GATT_PERM_READ`/`WRITE`(암호화 불필요)로 원복.
+  - `m_ble.c`: `bt_conn_set_security()`/`bt_conn_auth_cb`/`bt_conn_auth_info_cb`/
+    `security_changed`/`settings_load()` 등 v0.1.15에서 추가한 코드 전부 제거.
+  - v0.1.15는 이 세션에서 커밋되지 않았고 실물 보드에 플래시된 적도 없어, 기존 앱 연동
+    (v0.0.12)에 실질적 영향은 없었음.
+  - architecture.md §11 항목6-[5]는 다시 "보류" 상태로 복귀.
+
+## v0.1.17 (2026-09-21)
+
+- **[버그 수정] BLE 연결 끊김 시 ring buffer 용량과 grace period(§11 항목6-[3]) 불일치로
+  인한 실제 데이터 유실 — architecture.md §2.5(`RING_BUFFER_CAPACITY`)와 §11 항목6-[3]
+  (`BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS`)가 서로 다른 시점에 독립적으로 정해지면서
+  생긴 불일치를 사용자 요청("연결 끊겼을 때 센싱 데이터 ring buffer 저장 로직 구현")으로
+  재검토하다 발견**.
+  - "끊겨도 계속 측정+버퍼링" 로직 자체(`m_i2c.c`/`m_ble.c`)는 v0.0.14부터 이미 구현돼
+    있었으나, `RING_BUFFER_CAPACITY`(150샘플=15초)가 `BLE_DISCONNECT_STANDBY_TIMEOUT_
+    TICKS`(300 tick=30초)보다 작아서, 30초 끊김이 나면 15초 지점부터 이전 데이터가
+    overflow로 실시간 덮어써져 유실됐다(`m_i2c_ring_buffer_push()` 특성상 silent는
+    아니고 dropped_count는 증가하지만, 실제로는 유실).
+  - `config_app.h`: `RING_BUFFER_CAPACITY`를 `BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS`를
+    직접 참조하도록 묶어 앞으로 두 값이 다시 어긋나지 않게 함.
+  - **1차 시도(300 tick=30초 그대로 유지) 되돌림**: RAM 예산 검토 결과 Application 이미지
+    RAM 사용률이 87.8%(150샘플, 기존)→96.07%(300샘플)까지 올라가는 것을 빌드로 실측,
+    스택 오버플로우 등 위험 대비 여유(2.5KB)가 부족하다고 판단해 사용자에게 확인 요청.
+  - **사용자 결정: "grace period를 버퍼가 감당 가능한 수준으로 단축"** — `BLE_DISCONNECT_
+    STANDBY_TIMEOUT_TICKS`를 300→**220 tick(22초)**으로 하향. 결과 RAM 사용률 91.67%
+    (60,080/65,536B)로 안전 마진 확보. 22초까지는 데이터 유실 0% 보장(그 이상 끊기면
+    STANDBY 진입으로 측정 자체가 멈춰서 추가 유실도 없음).
+  - **빌드 검증 완료**: clean pristine rebuild, `dfu_application.zip` manifest
+    `version_MCUBOOT: "0.1.17+0"` 확인. **하드웨어 검증은 미실시**(실물 보드 없음) —
+    실제로 22초 끊김/재연결 시나리오에서 데이터 gap이 없는지, 22초 초과 시 STANDBY로
+    정상 전환되는지 실기 확인 필요.
+  - TODO(open-item): 30초 grace period라는 원래 §11 항목6-[3] 값 자체가 정책값이
+    아니라 초기값이라고 명시돼 있었음 — 이번 22초 변경도 마찬가지로 실측 후 조정
+    가능한 값. RAM 여유를 늘리려면(예: 배터리/온도 센서 등 향후 기능 추가 시) 다시
+    검토 필요.
+
+## v0.1.18 (2026-09-21)
+
+- **[프로토콜 변경, v2] DATA0/DATA1 notify 프레임에 timestamp_us/seq_num 추가 (8→16바이트)**
+  — 사용자 요청, `NCS_TedreamS2`(`Application/src/a/m_a_ble.c`) 분석 반영. S2는 센서
+  페이로드를 `[timestamp 4B LE][센서 데이터]` 순서로 구성하는 관례가 있어(architecture.md
+  §2.4 "32bit us 타임스탬프" 정책과 일치) 이를 그대로 계승, S2의 SALT/VER 핸드셰이크·
+  AES-CCM 암호화는 이 프로젝트 범위 밖이라 가져오지 않음(agents.md §4).
+  - 새 프레임(`m_ble_gatt.h`/`m_ble_proto.h`/`m_ble_proto.c`): offset 0-3 timestamp_us
+    (u32 LE), 4-7 seq_num(u32 LE), 8-9 Red630, 10-11 Red680, 12-13 NIR, 14-15 LED
+    index(전부 u16 LE).
+  - `BLE_PROTOCOL_VERSION` 1→2(`AS7341_VERSION` characteristic 0x1528로 조회 가능).
+  - 앱 쪽도 8→16바이트 프레임 파싱으로 업데이트 필요(구버전 앱은 이 프레임을 더 이상
+    올바르게 파싱 못 함 — 사용자가 앱을 함께 관리하므로 이번 범위에 포함해 진행).
+  - 기존 `AS7341_SEQ`(0x1529) notify characteristic은 제거하지 않고 유지(하위 호환).
+  - 기본 ATT MTU(23바이트, payload 20바이트) 안에 16바이트 프레임이 여전히 들어가므로
+    별도 MTU 협상 없이도 동작.
+
+- **[버그 수정, 고위험(안전상태)] BLE notify 혼잡(-ENOMEM) 시 안전상태 영구 래치되는
+  회귀 방지** — v0.1.17에서 발견된 위험(재연결 후 최대 220샘플 backlog를 텀 없이 몰아
+  notify하면 ATT 송신 버퍼 풀 고갈로 `bt_gatt_notify()`가 `-ENOMEM`을 반환할 수 있는데,
+  기존 코드는 이를 `MODULE_ERR_BLE_TX_FAILED`로 오분류해 `m_ctrl.c`가
+  `CTRL_STATE_DEGRADED`로 래치 — IEC 60601 단일고장 철학에 따라 **재부팅 전까지 자동
+  복구 안 됨**, 즉 정상적인 backlog flush 상황에서 측정이 영구 정지될 수 있었음)를
+  해소.
+  - `m_ble.c`: `notify_sample()`/`notify_seq()`가 `-ENOMEM`을 `-ENOTCONN`/`-EINVAL`과
+    같은 "무해한 전달 실패"로 분류(architecture.md §11 항목6-[4] 원칙과 일관) —
+    `MODULE_ERR_BLE_TX_FAILED` 미보고, 안전상태 래치 안 됨.
+  - 추가로 congestion(`-ENOMEM`) 감지 시 다음 pop 전 `BLE_NOTIFY_CONGESTION_BACKOFF_MS`
+    (20ms) 대기를 넣어 컨트롤러가 송신 큐를 비울 시간을 확보 — 텀 없는 재시도로 혼잡이
+    반복되는 것을 완화.
+  - **빌드 검증 완료**: clean pristine rebuild, `dfu_application.zip` manifest
+    `version_MCUBOOT: "0.1.18+0"` 확인. **하드웨어 검증 미실시** — 실제로 220샘플
+    backlog flush 시 `-ENOMEM`이 재현되는지, congestion backoff로 안전상태 래치 없이
+    정상 flush되는지, 새 16바이트 프레임을 앱이 올바르게 파싱하는지 모두 실기 확인 필요.
+
+## v0.1.19 (2026-09-21)
+
+- **[전력 최적화] DATA0/DATA1 배칭 도입 + LED index 필드 제거 + connection interval/
+  peripheral latency 조정 요청** — 사용자 지적: "지금 Data에 LED Index가 필요한가?
+  10Hz마다 매번 notify하면 전력 소모가 클 것 같다, 프레임을 키워서 데이터를 묶어
+  보내자." 사용자와 두 가지 방향(범위: 배칭+connection interval 조정 함께 진행,
+  배치 크기: 협상된 MTU에서 자동 산출) 확인 후 진행.
+  - **LED index 제거**: `m_ble.c BLE_SAMPLE_LED_INDEX_FIXED`가 순차 LED 스트로빙
+    미구현으로 매 샘플 고정값 0만 나가던 죽은 필드였음 — 확인 후 제거.
+  - **DATA0/DATA1 v3 배칭 프레임**(`m_ble_proto.h`/`.c`, `BLE_PROTOCOL_VERSION` 2→3):
+    `[sample_count(1B)][record×N]`, record=timestamp_us(4B)+seq_num(4B)+Red630/
+    Red680/NIR(u16×3)=14바이트. N은 MTU 247(payload 244) 기준 상한 17, 실제 배치
+    크기는 `m_ble.c` MTU exchange 콜백이 매 연결마다 계산(협상 실패 시 N=1로 자동
+    축소, 별도 레거시 포맷 없이 동일 파서로 처리).
+  - **MTU 협상 + LE Data Length Update 우리(peripheral)가 선제 요청**
+    (`bt_gatt_exchange_mtu()`/`bt_conn_le_data_len_update()`, `prj.conf`
+    `CONFIG_BT_GATT_CLIENT`/`CONFIG_BT_USER_DATA_LEN_UPDATE` 추가) — 컨트롤러는 이미
+    251byte까지 지원하도록 기본 설정돼 있었음(`CONFIG_BT_CTLR_DATA_LENGTH_MAX=251` 등,
+    빌드 .config로 확인) — 앱/중앙기기가 먼저 요청 안 해도 동작하도록 함.
+  - **connection interval/peripheral latency 조정 요청**(`bt_conn_le_param_update()`):
+    30ms interval, latency 4(유휴 시 연결 이벤트 4/5 스킵) — architecture.md §2.4가
+    원래 열어둔 "S2 선례 범위(7.5~30ms), 실측 후 확정"의 초기값. 배칭만 하고 이 조정을
+    안 하면 라디오가 여전히 자주 깨는데 보낼 데이터가 없는 상황이 되어 전력 절감
+    효과가 제한적이라는 점을 사용자와 확인 후 함께 적용.
+  - **AS7341_SEQ(0x1529) notify 중단**: 배칭 프레임 레코드 자체에 seq_num이 포함돼
+    "DATA0/DATA1과 같은 tick에 SEQ도 함께 notify" 개념이 배칭과 안 맞아 호출 제거.
+    GATT characteristic 선언은 하위 호환 위해 유지(구독해도 비용 없음, 그냥 안 옴).
+  - **재연결 안전성 설계**: 배치 버퍼(`s_batch`, 최대 17샘플)에 샘플이 오래 머무르면
+    그 사이 연결이 끊길 때 ring buffer 기반 재연결 안전장치(§11 항목6-[3]) 밖에서
+    유실될 위험이 있다 — "배치가 다 찼거나 flush timeout(2초)일 때만 필요한 만큼
+    한 번에 pop 후 즉시 notify"하는 구조로 유실 위험 구간을 pop+notify 처리 시간
+    (수 ms 이하)으로 최소화했다. 이를 위해 `m_i2c_ring_buffer_count()`(pop 없이 개수만
+    확인) 신규 추가.
+  - **빌드 검증 완료**: clean pristine rebuild, `version_MCUBOOT: "0.1.19+0"`,
+    RAM 92.50%(60,624B, +544B), FLASH 74.10%(+3.7KB, GATT_CLIENT/DLE 코드).
+    **하드웨어 검증 미실시** — 실제 배치 크기가 기대대로 산출되는지, connection
+    param 조정이 실제로 받아들여지는지(중앙기기가 거부/재협상 가능), 앱이 새
+    배칭 프레임을 올바르게 파싱하는지, 전력 절감이 실측되는지(AT-06) 전부 확인 필요.

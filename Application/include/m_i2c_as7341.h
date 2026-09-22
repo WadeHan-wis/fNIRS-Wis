@@ -57,6 +57,10 @@ extern "C" {
 #define AS7341_SMUX_CHANNEL_COUNT 6
 #define AS7341_MEASURE_TIMEOUT_MS 200
 
+/* _ref_fnirs_example(src/as7341.c)와 동일하게 ATIME은 고정하고 ASTEP만 가변으로 적분시간을
+ * 조절한다(2026-09-21, "레퍼런스와 동일 세팅" 정정 — m_i2c_as7341_set_integration_time() 참고). */
+#define AS7341_ATIME_FIXED 99
+
 /* SMUX가 F5~F8+Clear+NIR로 구성됐을 때의 ADC 채널(CH0~CH5) 배치
  * (datasheet §8.1/8.2 + 레퍼런스 SMUX 설정 기준):
  *   CH0=F5(555nm) CH1=F6(590nm) CH2=F7(630nm) CH3=F8(680nm) CH4=Clear CH5=NIR(910nm)
@@ -81,9 +85,13 @@ module_err_t m_i2c_as7341_init(m_i2c_as7341_dev_t *dev, const struct device *i2c
 
 /* gain/integration time 설정. 런타임 변경 시 호출부에서 반드시 변경 시점을 로그/패킷에
  * 기록해야 한다 (codingstandard.md §6, 누락 시 리뷰 반려 사유).
+ *
+ * integration_20ms_units: BLE AS7341_CONFIG의 integration time 필드와 동일 단위(1 unit=20ms
+ * 목표치, ATIME 고정+ASTEP 가변으로 환산 — _ref_fnirs_example과 동일 방식, 2026-09-21).
  */
 module_err_t m_i2c_as7341_set_gain(m_i2c_as7341_dev_t *dev, uint16_t gain);
-module_err_t m_i2c_as7341_set_integration_time(m_i2c_as7341_dev_t *dev, uint16_t integration_time);
+module_err_t m_i2c_as7341_set_integration_time(m_i2c_as7341_dev_t *dev,
+						uint8_t integration_20ms_units);
 
 /* 채널별 raw intensity 1회 읽기 (3파장 raw_out[NIRS_WAVELENGTH_COUNT]에 채움).
  * 포화/저신호 감지 시 MODULE_ERR_SENSOR_SATURATION / MODULE_ERR_SENSOR_LOW_SIGNAL 반환.

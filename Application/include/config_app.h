@@ -20,7 +20,7 @@ extern "C" {
  */
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 1
-#define FW_VERSION_PATCH 11
+#define FW_VERSION_PATCH 19
 
 /* nirs_sample_t.fw_version(uint16_t)에 담기 위한 패킹: MAJOR(4bit)|MINOR(4bit)|PATCH(8bit) */
 #define FW_VERSION_PACKED \
@@ -67,8 +67,17 @@ typedef enum {
 	NIR_SENSOR_COUNT,
 } nir_sensor_id_t;
 
-/* --- Ring buffer (architecture.md §2.5: 100~200 샘플) --- */
-#define RING_BUFFER_CAPACITY 150
+/* --- Ring buffer (architecture.md §2.5: 100~200 샘플 원안) ---
+ * [버그 수정, 2026-09-21] 원안(100~200)은 BLE notify 지연/혼잡(5~10초) 버티기만 고려한
+ * 값이었는데, 이후 §11 항목6-[3] Safety 대응으로 도입된 BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS
+ * (연결 끊겨도 30초는 계속 측정+버퍼링)와 서로 검토 없이 따로 정해져 있었다 — 150샘플(15초
+ * 분량)로는 30초 grace period의 절반도 못 버티고 앞부분 데이터가 실시간으로 덮어써져
+ * 유실됐다(m_i2c_ring_buffer_push() overflow 시 가장 오래된 샘플 덮어쓰기, silent는
+ * 아니지만 dropped_count만 늘고 실제로는 유실). BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS를
+ * 그대로 참조해 두 값이 다시 어긋나지 않게 한다(정의는 config_app.h 아래쪽, 매크로라 순서
+ * 무관 — 실제 확장은 이 파일 전체가 include된 뒤 일어난다).
+ */
+#define RING_BUFFER_CAPACITY BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS
 
 /* --- LED 상태 시나리오 (m_i2c.c가 관리, pinmap.md §6) ---
  * SW1은 MAX16054를 통해 VBAT를 하드웨어적으로 on/off한다 — MCU에는 GPIO로 연결되어
@@ -158,9 +167,16 @@ typedef enum {
 /* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[3]): BLE 연결이 끊겨도
  * 즉시 측정을 멈추지 않고 ring buffer에 계속 버퍼링하다가, 이 tick 수를 넘겨도 재연결이
  * 안 되면 저전력 대기모드(I2C_LED_MODE_STANDBY)로 전환한다. RTC tick = 100ms(SAMPLE_RATE_HZ)
- * 기준이므로 300 tick = 30초. 제품 정책값 아님 — 실측 후 조정 가능한 초기값이다.
+ * 기준. 제품 정책값 아님 — 실측 후 조정 가능한 초기값이다.
+ * [버그 수정, 2026-09-21] 원래 300 tick(30초)이었으나 RING_BUFFER_CAPACITY(위 §2.5)가
+ * 이 값을 그대로 참조하도록 묶으면서, RAM 예산(nRF52832 64KB) 안에서 안전 마진을 두고
+ * 감당 가능한 220 tick(22초)으로 낮췄다 — 300으로 두면 Application 이미지 RAM 사용률이
+ * 96.07%(여유 2.5KB)까지 올라가 스택 오버플로우 등 위험이 있음을 실측 확인(2026-09-21,
+ * 사용자 결정: grace period를 버퍼가 감당 가능한 수준으로 단축). 220으로는 RAM 사용률
+ * 약 90%대 유지, 22초 내내 데이터 유실 없이 보장된다(그 이상 끊기면 STANDBY 진입 후 측정
+ * 자체가 중단되므로 추가 유실 없음, 아래 STANDBY 전환 로직 참고).
  */
-#define BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS 300
+#define BLE_DISCONNECT_STANDBY_TIMEOUT_TICKS 220
 
 /* STANDBY 중 "살아있음 + 연결 대기 중"을 알리는 저전력 점멸 패턴 — LED1(640nm)만
  * BLE_STANDBY_BLINK_PERIOD_TICKS(2초)마다 BLE_STANDBY_BLINK_ON_TICKS(100ms) 짧게 켠다.

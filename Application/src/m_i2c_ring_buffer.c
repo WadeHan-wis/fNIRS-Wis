@@ -100,3 +100,14 @@ uint32_t m_i2c_ring_buffer_get_max_usage(void)
 
 	return usage;
 }
+
+uint32_t m_i2c_ring_buffer_count(void)
+{
+	uint32_t count;
+
+	k_mutex_lock(&mtx_ring_buffer, K_FOREVER);
+	count = s_count;
+	k_mutex_unlock(&mtx_ring_buffer);
+
+	return count;
+}
