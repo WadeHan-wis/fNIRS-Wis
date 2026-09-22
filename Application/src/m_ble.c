@@ -27,11 +27,16 @@ LOG_MODULE_REGISTER(m_ble, LOG_LEVEL_INF);
  * 전송 전에 짧게 대기해서 컨트롤러가 큐를 비울 시간을 준다. */
 #define BLE_NOTIFY_CONGESTION_BACKOFF_MS 20
 
-/* [전력 최적화, 2026-09-21] 사용자 요청: 10Hz마다 매번 notify하면 BLE 전력 소모가
- * 크다 — 샘플을 모아서 한 번에 보내는 배칭 도입(m_ble_proto.h v3 스펙 참고). 배치가
- * 다 차지 않아도(예: cycle/active 게이팅으로 샘플이 뜸하게 들어오는 설정) 데이터가
- * 무한정 묵히지 않도록 최대 대기 시간도 둔다. */
-#define BLE_BATCH_FLUSH_TIMEOUT_MS 2000
+/* [전력 최적화, 2026-09-22] 배치 flush 주기 — "몇 개를 묶을지"는 협상된 MTU가 결정하지만
+ * (s_batch_capacity, 프레임 하나에 들어가는 개수), "얼마나 자주 무선을 깨워서 보낼지"는
+ * 이 값이 별도로 통제한다. 사용자와 논의 후 결정: 센싱 주기(cycle/active 게이팅에 따라
+ * 들쭉날쭉할 수 있음)가 아니라, 전력 절감이 실제로 통제해야 하는 대상인 "무선 송신
+ * 빈도" 기준으로 고정 — MTU 협상이 실패해 프레임당 1개씩만 담기는 상황(capacity=1)에도
+ * 매 tick(100ms)마다 즉시 전송되는 걸 막아준다(이 경우 이 주기 동안 쌓인 걸 여러 프레임
+ * 으로 나눠 한 번에 몰아서 보냄 — 아래 m_ble_task_entry() 참고). 실시간성/배터리
+ * 트레이드오프의 초기값 — AT-06 전류소비 실측 후 조정 가능.
+ */
+#define BLE_BATCH_FLUSH_INTERVAL_MS 1000
 
 /* notify 대상 연결 — on_connected/on_disconnected에서만 갱신(BLE Task 컨텍스트 단일 소비). */
 static struct bt_conn *s_conn;
@@ -369,9 +374,10 @@ void m_ble_task_entry(void *p1, void *p2, void *p3)
 		k_sleep(K_FOREVER); /* BLE stack 없이는 이 태스크가 할 일이 없다 */
 	}
 
-	/* [전력 최적화, 2026-09-21] 배치가 다 차지 않은 상태로 얼마나 기다렸는지 추적 —
-	 * 0이면 "현재 대기 중인 미전송 샘플 없음"을 의미한다. */
-	int64_t pending_since_uptime = 0;
+	/* [전력 최적화, 2026-09-22] 마지막으로 flush한 시각 — BLE_BATCH_FLUSH_INTERVAL_MS
+	 * 간격을 강제하는 기준점. 0이면 "아직 한 번도 flush 안 함"이 아니라 그냥 k_uptime_get()
+	 * 기준 과거이므로 최초 데이터 도착 시 바로 flush 조건을 만족한다(문제 없음). */
+	int64_t last_flush_uptime = 0;
 
 	while (1) {
 		/* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[3]): 연결이 끊긴
@@ -381,49 +387,49 @@ void m_ble_task_entry(void *p1, void *p2, void *p3)
 		 * acquire+push한다(reset_to_device_on() 즉시 호출 안 함, m_i2c.c 참고).
 		 */
 		uint32_t available = m_ctrl_is_ble_connected() ? m_i2c_ring_buffer_count() : 0;
+		int64_t now = k_uptime_get();
 
-		if (available == 0) {
-			pending_since_uptime = 0;
+		if (available == 0 || (now - last_flush_uptime) < BLE_BATCH_FLUSH_INTERVAL_MS) {
+			/* 아직 flush 주기가 안 됐거나 보낼 데이터가 없다 — ring buffer에 그대로
+			 * 두고(pop하지 않음, 위 주석 참고) 짧게 기다렸다가 다시 확인한다. */
 			k_sleep(K_MSEC(BLE_POLL_INTERVAL_MS));
 			m_ctrl_notify_alive(CTRL_ALIVE_BLE);
 			continue;
 		}
 
-		if (pending_since_uptime == 0) {
-			pending_since_uptime = k_uptime_get();
-		}
-
+		/* [전력 최적화, 2026-09-22] flush 주기가 됐다 — 지금까지 쌓인 걸 전부 비운다.
+		 * 한 프레임(s_batch_capacity, MTU가 결정)보다 많이 쌓였으면 여러 프레임으로
+		 * 나눠서 이 한 번의 "무선 깨우는 시점"에 몰아 보낸다 — MTU 협상이 잘 안 돼
+		 * capacity가 작아도(최악 1), 무선을 깨우는 빈도 자체는 이 루프 한 바퀴로
+		 * 통제된다(매 tick마다 즉시 전송되던 문제 방지).
+		 */
 		uint16_t capacity = s_batch_capacity;
-		bool batch_full = available >= capacity;
-		bool timed_out = (k_uptime_get() - pending_since_uptime) >= BLE_BATCH_FLUSH_TIMEOUT_MS;
 
-		if (!batch_full && !timed_out) {
-			/* 아직 배치를 채울 시간/데이터가 더 있다 — ring buffer에 그대로 두고
-			 * (pop하지 않음, 위 주석 참고) 짧게 기다렸다가 다시 확인한다. */
-			k_sleep(K_MSEC(BLE_POLL_INTERVAL_MS));
-			m_ctrl_notify_alive(CTRL_ALIVE_BLE);
-			continue;
+		while (available > 0) {
+			uint16_t to_pop = (available < capacity) ? (uint16_t)available : capacity;
+
+			s_batch_count = 0;
+			while (s_batch_count < to_pop && m_i2c_ring_buffer_pop(&s_batch[s_batch_count])) {
+				s_batch_count++;
+			}
+
+			if (s_batch_count == 0) {
+				break; /* pop 실패(경쟁 상태로 그 사이 비었음) — 방어적 탈출 */
+			}
+
+			bool congested = flush_batch();
+
+			available -= s_batch_count;
+
+			if (congested) {
+				/* [버그 수정, 2026-09-21] ATT 송신 버퍼 풀 고갈 시 다음 프레임을
+				 * 곧바로 또 시도하면 혼잡이 반복될 수 있다 — 짧게 대기해서
+				 * 컨트롤러가 큐를 비울 시간을 준다(위 notify_batch() 주석 참고). */
+				k_sleep(K_MSEC(BLE_NOTIFY_CONGESTION_BACKOFF_MS));
+			}
 		}
 
-		/* 배치가 다 찼거나 flush timeout — 필요한 만큼만 한 번에 pop해서 곧바로
-		 * notify한다(위 s_batch 주석 참고, 유실 위험 구간 최소화). */
-		uint16_t to_pop = (available < capacity) ? (uint16_t)available : capacity;
-
-		s_batch_count = 0;
-		while (s_batch_count < to_pop && m_i2c_ring_buffer_pop(&s_batch[s_batch_count])) {
-			s_batch_count++;
-		}
-
-		bool congested = flush_batch();
-
-		pending_since_uptime = 0;
-
-		if (congested) {
-			/* [버그 수정, 2026-09-21] ATT 송신 버퍼 풀 고갈 시 다음 배치를 곧바로
-			 * 또 시도하면 혼잡이 반복될 수 있다 — 짧게 대기해서 컨트롤러가 큐를
-			 * 비울 시간을 준다(위 notify_batch() 주석 참고). */
-			k_sleep(K_MSEC(BLE_NOTIFY_CONGESTION_BACKOFF_MS));
-		}
+		last_flush_uptime = k_uptime_get();
 
 		/* Watchdog(Rev3, R3-1) 생존 신호 (m_ctrl.h 참고). */
 		m_ctrl_notify_alive(CTRL_ALIVE_BLE);

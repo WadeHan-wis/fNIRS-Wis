@@ -4,6 +4,9 @@
  * Task     : I2C Task 컨텍스트에서만 호출 (blocking 가능, ISR 호출 금지).
  *            AS7341 측정 정확도를 위해 LED는 오직 m_i2c 태스크만 구동한다 —
  *            다른 태스크(CTRL 등)에서 직접 호출하지 않는다.
+ *            [예외, 2026-09-22] main()이 부팅 진단용으로 커널 시작 직후(어떤 태스크도
+ *            시작하기 전) 1회 호출한다 — main.c 상단 주석 참고. 이 시점엔 AS7341
+ *            측정이 아직 없어 원칙과 충돌하지 않는다.
  * Depends  : app.overlay의 &pwm0 + zephyr,user pwms 프로퍼티
  *
  * 640/680/950nm(PoC v1 LED3 실장은 980nm, architecture.md §11) LED를 PWM duty로

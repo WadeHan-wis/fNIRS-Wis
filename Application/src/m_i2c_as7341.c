@@ -140,20 +140,8 @@ module_err_t m_i2c_as7341_init(m_i2c_as7341_dev_t *dev, const struct device *i2c
 
 	LOG_INF("AS7341(%s) SMUX 구성 성공 — init 완료", dev->i2c_dev->name);
 
-	/* SP_EN(스펙트럴 엔진)은 init 시 1회만 켜고 이후 절대 재기록하지 않는다 — datasheet가
-	 * free-running(SPM) 모드로 문서화하는 대로, SMUX 구성 이후 계속 켜둔 채로 두면 센서가
-	 * 백그라운드에서 끊김 없이 연속 적분한다. _ref_fnirs_example(같은 AS7341 3파장
-	 * F7/F8/NIR 구성을 실사용 검증한 레퍼런스, src/as7341.c as7341_init_device())도 이
-	 * 방식이다 — 매 읽기마다 ENABLE을 다시 쓰지 않는다. m_i2c_as7341_read_raw()가 매
-	 * tick마다 이 레지스터를 재기록하던 이전 방식은 architecture.md §11 항목5의 미해결
-	 * 우려사항("LED on 구간과 실제 적분 구간이 정확히 일치한다는 보장 없음")과도 연결돼
-	 * 있었음 — 불필요한 재기록 자체를 제거해 레퍼런스와 동일한 free-running 방식으로 정정.
-	 */
-	err = as7341_reg_write(dev, AS7341_REG_ENABLE, AS7341_ENABLE_PON | AS7341_ENABLE_SP_EN);
-	if (err != 0) {
-		return MODULE_ERR_I2C_TIMEOUT;
-	}
-
+	/* SP_EN은 여기서 켜지 않는다 — m_i2c_as7341_read_raw()가 매 호출마다 새로 트리거한다
+	 * (아래 read_raw() 주석 참고, 2026-09-22 정정). init에서는 PON만 걸어둔다. */
 	dev->initialized = true;
 	return MODULE_ERR_OK;
 }
@@ -210,6 +198,44 @@ module_err_t m_i2c_as7341_set_integration_time(m_i2c_as7341_dev_t *dev,
 	return (err == 0) ? MODULE_ERR_OK : MODULE_ERR_I2C_TIMEOUT;
 }
 
+module_err_t m_i2c_as7341_trigger_measurement(m_i2c_as7341_dev_t *dev)
+{
+	if (dev == NULL) {
+		return MODULE_ERR_INVALID_PARAM;
+	}
+
+	if (!dev->initialized) {
+		return MODULE_ERR_NOT_INITIALIZED;
+	}
+
+	/* [정정, 2026-09-22] v0.1.12에서 "SP_EN은 init 1회만, free-running(SPM)"으로 바꿨었으나
+	 * (당시 근거: _ref_fnirs_example도 이 방식) — 그 레퍼런스는 LED가 상시 켜져 있는
+	 * 구조라 free-running이어도 LED와 적분 구간이 항상 겹친다. 우리 프로젝트는 이 함수를
+	 * 호출하는 m_i2c.c acquire_one_sample()이 매 샘플마다 LED를 켰다/끄는 구조(architecture.md
+	 * §5 "연속점등 금지")라, free-running 적분 주기와 LED on/off 주기가 서로 비동기로 돌면서
+	 * beat(맥놀이) 패턴으로 어긋나는 게 실기로 확인됨(architecture.md §11 항목5, 완전 암실
+	 * 테스트에서 ~53샘플 주기로만 큰 값이 찍히는 패턴). 그래서 매 샘플마다 SP_EN을
+	 * 0->1로 재기록해 새 적분 사이클을 명시적으로 시작한다(datasheet §10.2, SP_EN 재기록
+	 * 시 스펙트럴 엔진 재시작) — 호출부가 LED를 켠 "다음"에 이 함수를 호출하므로, 이렇게
+	 * 하면 이번에 읽는 적분 구간이 항상 LED on 구간 이후에 시작됨이 보장된다.
+	 *
+	 * [정정, 2026-09-22 v0.1.23] 트리거와 "적분 대기+읽기"를 분리했다 — NIR1/NIR2를
+	 * 순차로 트리거+대기+읽기 하면 두 센서의 적분 대기시간(각각 최대 AS7341_MEASURE_
+	 * TIMEOUT_MS)이 더해져서, 실측 결과 의도한 Cycle 300ms 대신 400ms로 밀리는 현상이
+	 * 발생함(호출부가 두 센서 모두 트리거를 먼저 걸고 나서 각각 대기+읽기를 하도록
+	 * 바꿔, 두 센서의 적분이 동시에 진행되게 함 — m_i2c.c acquire_one_sample() 참고). */
+	int err = as7341_reg_write(dev, AS7341_REG_ENABLE, AS7341_ENABLE_PON);
+	if (err != 0) {
+		return MODULE_ERR_I2C_TIMEOUT;
+	}
+	err = as7341_reg_write(dev, AS7341_REG_ENABLE, AS7341_ENABLE_PON | AS7341_ENABLE_SP_EN);
+	if (err != 0) {
+		return MODULE_ERR_I2C_TIMEOUT;
+	}
+
+	return MODULE_ERR_OK;
+}
+
 module_err_t m_i2c_as7341_read_raw(m_i2c_as7341_dev_t *dev, uint16_t raw_out[NIRS_WAVELENGTH_COUNT])
 {
 	if (dev == NULL || raw_out == NULL) {
@@ -220,10 +246,11 @@ module_err_t m_i2c_as7341_read_raw(m_i2c_as7341_dev_t *dev, uint16_t raw_out[NIR
 		return MODULE_ERR_NOT_INITIALIZED;
 	}
 
-	/* SP_EN은 init에서 1회만 켜고 여기서는 절대 재기록하지 않는다(위 m_i2c_as7341_init()
-	 * 주석 참고) — STATUS2.AVALID 폴링 + 채널 읽기만 수행한다. */
-	bool valid = false;
+	/* 호출부가 m_i2c_as7341_trigger_measurement()를 이미 호출해뒀다고 가정 — 여기서는
+	 * AVALID 폴링(적분 완료 대기) + 채널 읽기만 수행한다(위 trigger_measurement() 주석
+	 * 참고). */
 	int err;
+	bool valid = false;
 
 	for (int i = 0; i < AS7341_MEASURE_TIMEOUT_MS; i++) {
 		uint8_t status2 = 0;

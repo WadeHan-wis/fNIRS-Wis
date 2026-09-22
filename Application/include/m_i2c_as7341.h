@@ -93,7 +93,18 @@ module_err_t m_i2c_as7341_set_gain(m_i2c_as7341_dev_t *dev, uint16_t gain);
 module_err_t m_i2c_as7341_set_integration_time(m_i2c_as7341_dev_t *dev,
 						uint8_t integration_20ms_units);
 
+/* 새 적분 사이클을 명시적으로 시작한다(SP_EN 재기록) — LED를 켠 "다음"에 호출해야
+ * 이번 적분 구간이 LED on 구간과 동기화된다(2026-09-22, architecture.md §11 항목5).
+ * NIR1/NIR2를 둘 다 사용할 때는 두 인스턴스 모두 이 함수로 먼저 트리거를 걸고
+ * (적분이 동시에 진행되게), 그 다음에 m_i2c_as7341_read_raw()를 순서대로 호출한다 —
+ * 순서를 바꿔서 트리거→읽기를 센서별로 번갈아 하면 적분 대기시간이 순차로 더해져
+ * 의도한 측정 주기보다 느려진다(v0.1.23에서 실기로 확인된 회귀, CHANGELOG 참고).
+ */
+module_err_t m_i2c_as7341_trigger_measurement(m_i2c_as7341_dev_t *dev);
+
 /* 채널별 raw intensity 1회 읽기 (3파장 raw_out[NIRS_WAVELENGTH_COUNT]에 채움).
+ * 호출 전 반드시 m_i2c_as7341_trigger_measurement()로 이번 사이클을 트리거해뒀어야
+ * 한다 — 이 함수는 AVALID 폴링(적분 완료 대기)과 채널 읽기만 수행한다.
  * 포화/저신호 감지 시 MODULE_ERR_SENSOR_SATURATION / MODULE_ERR_SENSOR_LOW_SIGNAL 반환.
  * TODO(open-item): 채널별 saturation 임계 게인 실측 필요 (architecture.md §11).
  */

@@ -20,7 +20,7 @@ extern "C" {
  */
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 1
-#define FW_VERSION_PATCH 19
+#define FW_VERSION_PATCH 23
 
 /* nirs_sample_t.fw_version(uint16_t)에 담기 위한 패킹: MAJOR(4bit)|MINOR(4bit)|PATCH(8bit) */
 #define FW_VERSION_PACKED \
@@ -109,13 +109,20 @@ typedef enum {
 
 /* 부팅 버전 점멸 표시 (2026-09-17, architecture.md §11 항목6-[6] OTA 검증 과정에서
  * 도입 — TEMP_OTA_TEST_MARKER를 대체하는 정식 기능). SWD/RTT 연결 없이(조립된 상태)
- * 육안으로 "OTA가 실제로 적용됐는지"를 확인할 수 있어야 한다는 요구로 추가됨.
- * 부팅 직후(디바이스 On 순차점등 진입 전) LED 3개를 동시에 (FW_VERSION_PATCH + 1)회
- * 점멸한다. +1을 더하는 이유는 PATCH=0일 때 "0회 점멸"(=아무 표시도 없음)이 되는
- * 것을 피하기 위함 — 예: v0.1.1 → 2회 점멸, v0.1.2로 업데이트하면 3회 점멸로 바뀐다.
- * 업데이트 전/후 점멸 횟수가 달라졌는지만 보면 성공 여부를 판단할 수 있다.
+ * 육안으로 "부팅이 이 지점까지 정상 진행됐는지"를 확인하기 위한 기능이다.
+ * 부팅 직후(디바이스 On 순차점등 진입 전) LED 3개를 동시에 FW_VERSION_BOOT_BLINK_COUNT
+ * 회 점멸한다.
+ * [버그 수정, 2026-09-22] 원래는 (FW_VERSION_PATCH+1)회로 패치 버전에 따라 점멸
+ * 횟수가 계속 늘어나는 구조였다 — "업데이트 전/후 점멸 횟수 차이로 OTA 성공 여부
+ * 확인"이 목적이었으나, PATCH가 매 패치 +1되는 정책상 버전이 쌓일수록 이 블로킹
+ * 구간 자체가 계속 길어져 watchdog 타이밍과 충돌하는 버그로 실제 이어졌다(v0.1.13→
+ * v0.1.14, CHANGELOG 참고). 사용자 결정으로 고정 3회로 변경 — OTA 적용 여부 확인은
+ * 이제 BLE `AS7341_VERSION` characteristic(0x1528)으로 fw_version을 읽는 방식을
+ * 사용한다(앱이 이미 지원). 이 점멸은 "부팅이 여기까지 왔다"는 생존 신호 용도로만
+ * 남는다.
  */
 #define FW_VERSION_BOOT_BLINK_MS 150
+#define FW_VERSION_BOOT_BLINK_COUNT 3
 
 /* TEMP(개발용, 2026-09-15): AS7341 채널-파장 매핑 실측 검증용. 1이면 BLE 연동 대기 없이
  * 부팅 즉시 측정 시퀀스(acquisition)로 진입해서 raw 채널 값을 RTT로 바로 확인할 수 있다.

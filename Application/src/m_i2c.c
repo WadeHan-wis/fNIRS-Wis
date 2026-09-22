@@ -201,14 +201,14 @@ static module_err_t i2c_init(void)
 	 * 시작 전(부팅 시퀀스 중) 1회뿐이라 문제 없음 — ISR이 아니라 일반 태스크
 	 * 컨텍스트(m_i2c_task_entry → i2c_init).
 	 */
-	/* [버그 수정, 2026-09-21] 이 루프는 (FW_VERSION_PATCH+1)*2*FW_VERSION_BOOT_BLINK_MS만큼
-	 * 블로킹되는데, m_ctrl_notify_alive(CTRL_ALIVE_I2C)는 아래 RTC tick 메인루프에 들어가야만
-	 * 호출된다 — watchdog은 CTRL 태스크 시작 즉시 무장되므로(m_ctrl.c watchdog_init()),
-	 * PATCH가 커질수록(패치마다 무조건 +1) 이 루프 시간이 watchdog 타임아웃(4000ms)을
-	 * 넘어서면 아직 아무 문제도 없는데 watchdog 리셋이 걸린다(v0.1.13, PATCH=13에서 14*300=
-	 * 4200ms로 실제 발생 확인). 매 tick마다 alive 신호를 보내 이 블로킹 구간에서도 stale
-	 * 판정을 받지 않게 한다. */
-	for (int i = 0; i < (FW_VERSION_PATCH + 1); i++) {
+	/* [버그 수정, 2026-09-21] 이 루프는 FW_VERSION_BOOT_BLINK_COUNT*2*FW_VERSION_BOOT_BLINK_MS
+	 * 만큼 블로킹되는데, m_ctrl_notify_alive(CTRL_ALIVE_I2C)는 아래 RTC tick 메인루프에
+	 * 들어가야만 호출된다 — watchdog은 CTRL 태스크 시작 즉시 무장되므로(m_ctrl.c
+	 * watchdog_init()), 이 루프 시간이 watchdog 타임아웃(4000ms)을 넘어서면 아직 아무
+	 * 문제도 없는데 watchdog 리셋이 걸린다(v0.1.13에서 실제 발생 확인, 당시엔 점멸
+	 * 횟수가 PATCH에 비례해 계속 늘어나는 구조였음 — 2026-09-22 고정 횟수로 변경돼
+	 * 이 위험 자체는 사라졌지만, 매 tick alive 신호는 방어적으로 유지한다). */
+	for (int i = 0; i < FW_VERSION_BOOT_BLINK_COUNT; i++) {
 		m_i2c_led_all_on(I2C_LED_INDICATOR_DUTY_PERMILLE);
 		k_sleep(K_MSEC(FW_VERSION_BOOT_BLINK_MS));
 		m_i2c_led_all_off();
@@ -284,6 +284,18 @@ static void acquire_one_sample(nirs_sample_t *sample)
 		/* BLE AS7341_CONFIG로 설정된 duty 사용 (기본값 500‰) — apply_pending_ble_config() 참고. */
 		sample->led_duty[wl] = s_led_duty_permille[wl];
 		m_i2c_led_set_duty((nirs_wavelength_t)wl, sample->led_duty[wl]);
+	}
+
+	/* NIR1/NIR2를 먼저 둘 다 트리거해서 적분이 동시에 진행되게 한 뒤, 그 다음에
+	 * 순서대로 읽는다 — 트리거→읽기를 센서별로 번갈아 하면 적분 대기시간이 순차로
+	 * 더해져 의도한 측정 주기(Cycle)보다 느려짐(v0.1.23, m_i2c_as7341.h 주석 참고). */
+	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
+		module_err_t err = m_i2c_as7341_trigger_measurement(&s_as7341[i]);
+
+		if (err != MODULE_ERR_OK) {
+			sample->status = err;
+			m_ctrl_report_error(err);
+		}
 	}
 
 	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
