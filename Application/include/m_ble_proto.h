@@ -44,10 +44,12 @@
  * 됐다. GATT 선언 자체는 하위 호환을 위해 제거하지 않음(구독해도 그냥 아무 것도
  * 안 오는 것뿐, 비용 없음).
  *
- * TODO(open-item): cycle period/active window는 CONFIG에 저장·read-back은 하지만
- * 아직 RTC 샘플링 주기(config_app.h 고정 100ms/10Hz, Bresenham 보정)에는 반영하지
- * 않는다 — 검증된 고정 타이밍 로직을 성급하게 일반화하지 않기 위해 의도적으로 보류
- * (architecture.md §11 기록 예정). location interval도 현재 미사용.
+ * cycle period/active window는 CONFIG에 저장·read-back될 뿐 아니라, RTC tick 기반
+ * 게이팅(`m_i2c.c is_gate_active_tick()`)으로 실제 측정 빈도에도 반영된다 — v0.1.5(2026-
+ * 09-18)에서 구현, v0.1.6에서 실기 검증 완료(CHANGELOG 참고). integration time도
+ * `m_i2c_as7341_set_integration_time()`으로 반영됨(2026-09-22 100ms 설정 실기 확인).
+ * TODO(open-item): location interval(offset 1)만 여전히 미사용 — CONFIG read-back
+ * 값으로만 저장되고 실제 동작(측정 주기 등)에는 반영되지 않는다.
  */
 #ifndef M_BLE_PROTO_H_
 #define M_BLE_PROTO_H_
