@@ -11,7 +11,6 @@ target_sources(app PRIVATE
 	src/m_i2c_led.c
 	src/m_i2c_as7341.c
 	src/m_ble.c
-	src/m_ble_batch.c
 	src/m_ble_gatt.c
 	src/m_ble_proto.c
 	src/m_ctrl.c

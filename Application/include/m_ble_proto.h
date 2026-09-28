@@ -86,8 +86,25 @@ extern "C" {
  * v2(2026-09-21): DATA0/DATA1 프레임에 timestamp_us/seq_num을 직접 포함하도록 확장.
  * v3(2026-09-21): 배칭 프레임(헤더+가변개수 레코드)으로 재설계, LED index 제거
  * (위 AS7341_DATA0/DATA1 주석 참고) — 앱이 이 프로토콜 버전을 읽고 파서를 맞춰야 한다.
+ * v4(2026-09-28): Ambient light 제거(dark-frame subtraction) 도입 — 레코드 바이트
+ * 레이아웃/길이(14바이트)는 그대로이고, **seq_num(offset+4-7) 최상위 1비트(bit31)를
+ * "다크 프레임 여부" 플래그로 재사용**한다(새 필드 추가 없음, 프레임 크기 변경 없음).
+ *   bit31 = 1 : 다크 프레임 — LED 전부 OFF 상태로 측정(주변광+dark current만),
+ *               Red630/Red680/NIR는 이 상태에서의 raw count.
+ *   bit31 = 0 : 기존과 동일한 lit(LED 켜진) 프레임.
+ *   bit0-30   : 기존과 동일한 monotonic seq_num(최대 약 21억, wraparound 걱정 없음).
+ * 다크 프레임은 lit DARK_FRAME_LIT_INTERVAL(10)개마다 1개씩 추가로 삽입되며(펌웨어
+ * config_app.h), gain/ATIME/ASTEP은 바로 직전 lit 프레임과 항상 동일하다 — AS7341은
+ * 적분시간에 선형 비례하는 누적(합)연산이라(곱연산 아님, 5배 적분→5.2배 count로 이미
+ * 실측 확인됨) 앱은 **스케일링 없이 `lit_raw - dark_raw`만 하면** 순수 LED 신호를 얻는다.
+ * 앱은 자신에게 가장 가까운(직전) 다크 프레임을 최근값으로 유지(hold)하면서, 매 lit
+ * 프레임마다 그 값을 빼서 사용하는 방식을 권장한다(다크는 lit처럼 매번 오지 않으므로).
  */
-#define BLE_PROTOCOL_VERSION 3
+#define BLE_PROTOCOL_VERSION 4
+
+/* 위 v4 주석 참고 — 배칭 레코드 seq_num 필드 안에서 다크 프레임 여부를 나타내는 비트. */
+#define BLE_PROTO_SEQ_DARK_FLAG_BIT 0x80000000UL
+#define BLE_PROTO_SEQ_NUM_MASK      0x7FFFFFFFUL
 
 /* SEQ notify 프레임 포맷은 하위 호환을 위해 그대로 둔다 — 실제로 notify하는 코드는
  * 제거됐다(위 주석 참고, m_ble.c). */

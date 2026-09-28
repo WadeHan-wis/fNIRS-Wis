@@ -7,6 +7,117 @@
 
 ---
 
+## 2026-09-28 (펌웨어 v0.1.23 → v0.1.31, 이번 주 첫 근무일 — 오늘 계획 6개 전부 완료 + 메모리 정리 + RTT 모드 정정 + DCDC 활성화 + Watchdog 디버그 오발동 수정)
+
+### 오늘 한눈에 보기
+- **"71.58분 주기 재부팅 버그" 최초 보고 → 같은 날 오진으로 정정.** 9/24~27
+  3박 데이터에서 device_ts가 71.58분(2^32µs)마다 리셋되는 패턴을 처음엔 재부팅
+  버그(P0)로 보고했으나, 리셋 지점 wall-clock 간격(0~1초)·raw 채널값 연속성을
+  재확인한 결과 **재부팅이 전혀 아니었음을 확정** — `uint32_t` 타임스탬프의
+  정상적인 오버플로우(설계된 동작)일 뿐, 조치 불필요. 상세는
+  `app_handoff_device_ts_rollover_note.md` 참고. 이 건으로 갱신했던
+  트래커/Gantt/일일 업무일지의 "재부팅 버그" 관련 항목은 전부 되돌림.
+- **LED 프리셋 비교 종료**: 9/24·26(매뉴얼 25/50/75%) vs 9/25(프리셋A, 9/22/100%) 비교
+  결과 "정답 조합 없음" 확인 → 향후 매뉴얼 조합으로 고정 운용 확정.
+- **Ambient light 제거(dark-frame subtraction) 구현 완료(v0.1.24)** — lit 10개마다
+  다크 프레임(LED all-off, 동일 gain/ATIME/ASTEP) 1개 추가. BLE 프로토콜 v3→v4
+  (`seq_num` bit31을 다크 플래그로 재사용, 프레임 길이 변경 없음). **빌드 검증
+  완료**(App Flash 74.29%/RAM 92.50%, RAM 변화 없음). **하드웨어 검증 미실시.**
+- 앱 팀 핸드오프 문서 신규 작성: `app_handoff_dark_frame_context.md`,
+  `app_handoff_device_ts_rollover_note.md`.
+- **클럭 트리/타이머 프리스케일러 재계산 검증 완료(v0.1.25)** — Gantt "0. Baseline
+  & Handover" §2번(그동안 70%에서 정체)을 마무리. LFCLK 정확도 선언이 실제 실장
+  크리스탈(±20ppm) 대신 Zephyr 기본값(50ppm)으로 방치돼 있던 걸 발견/정정
+  (`CONFIG_CLOCK_CONTROL_NRF_K32SRC_20PPM`) — BLE RX 윈도우 과다 확장으로 인한
+  전력 낭비 가능성 개선(안전하지만 비효율적이던 오차). 조사 중 `pinmap.md`
+  HFXO 부품번호(`ECS-240-8-37CKM`→32MHz는 `ECS-320`이어야 함) 오기 추정 발견,
+  실물 확인 필요로 기록. **빌드 검증 완료**(App Flash 74.29%/RAM 92.50%, 변화
+  없음). **하드웨어 검증(BLE 전류소비 변화, AT-06) 미실시.**
+- **AS7341 STATUS2(ASAT/AVALID) 기반 포화 검출 구현 완료(v0.1.26)** — datasheet
+  (DS000504 v3-00 Figure 64, PDF 직접 조회)로 STATUS2(0xA3) bit3=ASAT_ANALOG/
+  bit4=ASAT_DIGITAL 정확한 위치 확인. `check_sensor_sanity()`의 포화 판정을 기존
+  고정 raw 임계값 방식에서 하드웨어 비트 기반으로 교체 — 게인/적분시간 무관 정확
+  판정, "채널별/게인별 정확한 풀스케일 계산" TODO 해소. **빌드 검증 완료**(App
+  Flash 74.30%/RAM 92.50%). **하드웨어 검증(강한 광원으로 실제 포화 유발) 미실시.**
+- **오전에 잡았던 계획을 오전 중 대부분 소진** — 원래 오늘 할 일 3개(동등성검증/
+  dark-frame/클럭트리)를 오전에 다 끝내서, Gantt 전체를 다시 훑어 이번 주
+  마일스톤을 4개→8개로 확장(Watchdog fault recovery/패킷 포맷 문서화/LED settling
+  time 등 신규 추가). 일일 업무일지(Downloads)는 오후 작업 중 파일이 열려있어
+  저장 실패 — **STATUS2 완료분 반영은 파일 닫힌 뒤 재시도 필요**.
+- 일일 업무일지/Gantt/트래커(Downloads 사본) 3종 오늘 분 동기화(재부팅 오진 정정 +
+  클럭 트리·STATUS2 완료 반영, 단 일일 업무일지는 파일 잠김으로 일부 미반영).
+
+- **Sensor(AS7341) fault recovery 구현 완료(v0.1.27)** — Gantt "Watchdog + sensor
+  fault recovery"(R3-1) 중 마지막까지 남아있던 항목 마무리. I2C 트리거/읽기 실패 시
+  즉시 `CTRL_STATE_DEGRADED` 래치하지 않고 AS7341 재초기화로 먼저 자체 복구를
+  시도, 연속 3회 실패해야만 기존처럼 안전상태로 에스컬레이션. **빌드 검증
+  완료**(App Flash 74.45%/RAM 92.50%). **하드웨어 검증(I2C 라인 실제 차단) 미실시.**
+- **협력사(TedNeuro) 연동 문의 대응** — GATT UUID/CONFIG/DATA0·DATA1 v4 배칭
+  프레임 등 프로토콜 질의에 답변, 외부 공유용 문서 3종 신규 작성:
+  `protocol_version_v4.md`(프로토콜 스펙), `tedneuro_firmware_integration.md`
+  (샘플코드 대비 비교+빌드/툴체인 가이드), `tedneuro_partner_qa_response.md`
+  (Q&A 답변, 영문). 소스 저장소 공유 자체는 Wis Medical의 별도 결정 사항으로 안내.
+- **오늘 계획했던 6개 작업 전부 완료**: 동등성검증/dark-frame/클럭트리/STATUS2
+  포화검출/패킷포맷문서화(협력사 대응 과정에서 자연스럽게 산출)/Watchdog
+  sensor fault recovery.
+- **메모리/RAM 최적화 1차(v0.1.28)** — `west build -t ram_report` 실측 기반 계획
+  문서(`memory_ram_optimization_plan.md`) 작성, 저위험 항목만 오늘 실행: 미사용
+  `m_ble_batch.c`/`.h` 삭제, 해소된 TEMP_ 디버그 훅 3개 제거. 가장 큰 절감 여지인
+  mcumgr netbuf(9,900B, 16.3%)는 OTA 재검증이 필요한 고위험 변경이라 보류.
+- **RTT 로그 모드 BLOCK→OVERWRITE 정정(v0.1.29)** — 사용자가 제공한 RTT 동작 원리
+  자료를 실제 NCS Kconfig(`log_backend_rtt.c`)와 대조 검증 후 반영. 지금까지 명시
+  설정이 없어 기본값 BLOCK(재시도 후 드롭)으로 동작 중이었고, 이 때문에 J-Link
+  없이 오래 방치하면 사실상 로그가 거의 안 쌓이는 상태였음을 확인 — OVERWRITE로
+  전환해 "장시간 방치 후 나중에 연결해서 최근 상황 확인" 시나리오가 실제로
+  동작하게 함. 빌드 검증 완료(App Flash -128B, RAM 변화 없음), **하드웨어 검증
+  미실시**.
+- **DCDC 레귤레이터 활성화(v0.1.30)** — BLE Tx power 문의에 답하다가 nRF52832
+  데이터시트 실측치(TX 전류 0dBm 기준 LDO 11.6mA vs DCDC 5.3mA)를 확인, 보드에
+  이미 DCDC 인덕터가 실장돼 있음(`pinmap.md` §5)을 재확인하고 활성화. 처음
+  `CONFIG_SOC_DCDC_NRF52X=y`(prj.conf)로 시도했으나 이 NCS 버전에서 deprecated라
+  빌드 에러 — devicetree(`app.overlay` `&reg` 노드, `regulator-initial-mode`)로
+  정정 적용, 빌드 검증 완료. **전류소비/전압리플/기능회귀 하드웨어 검증 전부
+  미실시** — 전원부 전체 영향 변경이라 CHANGELOG.md에 5단계 검증 계획 기록.
+- **VS Code 빌드 폴더 경로 사고** — 세션 중 제가 `Application/build`(사용자가 VS
+  Code로 실제 빌드/플래시하던 진짜 빌드 폴더)를 "제 실수로 생긴 중복"으로 오판해
+  삭제 → nRF Connect 확장의 빌드 설정 목록이 사라짐. 사용자가 VS Code에서 새로
+  빌드 설정을 재생성해 해결, 이후 `code/build`(제가 터미널에서 쓰던 경로)는
+  삭제하고 **`Application/build` 하나로 통일**하기로 함 — 앞으로 터미널 빌드도
+  이 경로 사용.
+- **AS7341 STATUS2 포화 검출(v0.1.26) 하드웨어 검증 완료** — 사용자가 휴대폰
+  손전등으로 실제 포화 유발, RTT 로그에서 `SATURATION` 경고가 정확히 트리거되는
+  것 확인. raw 값이 35900에서 pin되는 것도 지난 CSV 분석과 일치. **AT-04 이걸로
+  완료 처리 가능.**
+- **RTT OVERWRITE 모드(v0.1.29) 실측 확인** — 위 포화 테스트 로그가 워치독 리셋
+  직전까지(로그 한 줄이 중간에 끊길 때까지) 유실 없이 이어짐 — 의도한 대로 동작.
+- **Watchdog이 RTT 디버그 세션 연동 중에만 오발동하던 버그 발견 및 수정(v0.1.31)**
+  — 사용자가 "BLE만 쓰면 안 걸리는데 RTT까지 같이 켜면 워치독 리셋됨"을 실기로
+  제보. `wdt_nrfx.c` 확인 결과 `WDT_OPT_PAUSE_HALTED_BY_DBG` 없이 세팅하면 SWD
+  디버거의 코어 halt 중에도 워치독이 계속 돎을 확인 — 옵션 추가로 수정. 디버거
+  미연결 시(정상/양산 동작)에는 영향 없음. 빌드 검증 완료, **하드웨어 검증
+  (RTT+BLE 동시 연동 재현 테스트) 미실시**.
+
+### 오늘 마감 처리 완료
+- **일일 업무일지(Downloads)/Gantt 오후 마감 반영 완료** — STATUS2 하드웨어 검증,
+  Watchdog sensor fault recovery, RAM 최적화, RTT 모드 정정, DCDC 활성화, Watchdog
+  디버그 오발동 수정, TedNeuro 대응까지 전부 오늘자로 기록. 트래커(저장소 내
+  `fNIRS_FW_v1.0_트래커.html`)는 이번 세션에서 건드리지 않음 — 다음에 필요하면 확인.
+
+### 다음 세션(9/29)에서 먼저 할 일
+1. 배터리 실사용 검증 재개(자연 방전까지, 이번엔 앱 로깅 공백 없이) — 이번 주
+   유일하게 물리적 시간이 걸리는 항목, 최우선.
+2. **Watchdog 하드웨어 재검증** — (a) RTT+BLE 동시 연동 상태로 포화 재현 테스트해서
+   디버그-halt 오발동 수정(v0.1.31)이 실제로 해소됐는지, (b) I2C 라인 실제 차단으로
+   sensor fault recovery(v0.1.27)의 자동복구/3회 에스컬레이션이 맞게 동작하는지.
+3. DCDC 활성화(v0.1.30) 전류소비/전압리플/기능회귀 검증 — CHANGELOG.md v0.1.30
+   5단계 계획 참고.
+4. Ambient light 제거 정량 검증 마무리(레퍼런스 대비 비교, 완전 암실 다크값 안정성).
+5. 9/24·9/26(매뉴얼 조합) 데이터로 레퍼런스 대비 동등성 검증 결론 문서화.
+6. `pinmap.md` HFXO 부품번호 오기 추정 건 — 실물 보드 각인 확인.
+7. LED on/off settling time·dark period 확정(남은 마일스톤).
+
+---
+
 ## 2026-09-23 (펌웨어 변경 없음 — 문서/크로스토크 분석. 이번 주 마지막 근무일, 다음 근무일 9/28 월)
 
 ### 오늘 한눈에 보기

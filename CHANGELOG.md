@@ -936,3 +936,213 @@
   확인. **여전히 미반영인 항목은 location interval(offset 1)뿐** — CONFIG
   read-back만 되고 실제 동작에는 반영 안 됨(그대로 TODO 유지).
 
+## v0.1.24 (2026-09-28)
+
+- **[신규 기능] Ambient light 제거(dark-frame subtraction) 도입** — 9/24~27 3박 수면
+  데이터 분석 중 "레퍼런스는 전체 행의 50%가 다크 프레임(LED off, ambient-subtracted)인데
+  우리 raw는 다크 프레임이 없어 raw 정의 자체가 다르다"던 architecture.md §11 항목5의
+  미해결 항목에 대응.
+  - `m_i2c.c`: `acquire_one_sample()`을 `acquire_common(sample, dark)`으로 리팩터링하고
+    `acquire_one_dark_sample()`을 추가. lit `DARK_FRAME_LIT_INTERVAL`(10)개마다 다크
+    프레임 1개를 추가로 ring buffer에 push한다(사용자 결정 — 다크는 주변광/dark
+    current라 생리신호처럼 빠르게 안 변해서 lit과 1:1일 필요가 없고, 1:10이면 데이터량/
+    전력 증가를 +10%로 제한하면서도 오프셋 추적엔 충분). 다크 프레임은 LED를 전부 끈
+    채로 lit과 **동일한 gain/ATIME/ASTEP**으로 측정(절대 바꾸지 않음) — AS7341은
+    적분시간에 선형 비례하는 누적(합)연산이라(9/23 실측: 적분 5배→count 5.2배, 곱연산
+    아님) 앱이 스케일링 없이 `lit_raw - dark_raw`만 하면 순수 LED 신호를 얻을 수 있다.
+    다크 프레임에는 `check_sensor_sanity()`(포화/저신호 판정)를 적용하지 않는다 — 다크는
+    원래 low signal이 정상이라 매번 오탐되는 걸 방지.
+  - `nirs_sample_t`(`nirs_sample.h`)에 `bool is_dark` 필드 추가.
+  - **BLE 프로토콜 v3→v4**(`BLE_PROTOCOL_VERSION`, `m_ble_proto.h`): 배칭 레코드
+    바이트 레이아웃/길이(14바이트)는 그대로 두고, 기존 `seq_num`(offset+4-7) 필드의
+    **최상위 1비트(bit31)를 다크 프레임 플래그로 재사용**(새 필드 추가/프레임 크기 변경
+    없음) — 앱은 이 프로토콜 버전을 읽고 파서를 갱신해야 한다(상세 스펙은
+    `app_handoff_dark_frame_context.md` 참고).
+  - **RAM 영향 없음**: `RING_BUFFER_CAPACITY`는 정적 배열 크기라 push 빈도가 +10%
+    늘어도 재조정 불필요(기존 용량 여유로 흡수).
+  - **빌드 검증 완료**(`west build -b nrf52dk/nrf52832 Application -p always`,
+    `version_MCUBOOT: "0.1.24+0"`, 에러 없음, App Flash 74.29%/RAM 92.50% — v0.1.23
+    대비 RAM 변화 없음, 구조체 패딩에 흡수됨). **하드웨어 검증 미실시** — 다음
+    세션에서 (1) 완전 암실에서 다크 채널값 안정성, (2) 앱이 v4 파서로 lit/dark 분리
+    후 레퍼런스 대비 채널비율 재비교 필요.
+
+## v0.1.25 (2026-09-28)
+
+- **[정정] 클럭 트리 재계산 검증 완료** — 트래커 "0. Baseline & Handover" §2번 항목
+  (`2) 클럭 트리/타이머 프리스케일러 32MHz 기준 재계산 검증`, 그동안 70%에서 정체)
+  마무리. LFCLK 소스(`CONFIG_CLOCK_CONTROL_NRF_K32SRC_XTAL`)는 이미 기본값으로
+  맞았으나, **정확도(ppm) 선언은 한 번도 검토된 적이 없어 Zephyr 기본값인
+  50ppm(31~50ppm 구간)으로 방치**돼 있었다. 실제 실장 부품(`pinmap.md` §5, LFXO
+  ECS Inc. ECS-.327-12.5-12-TR) 데이터시트 기준 정확도는 **±20ppm**으로 확인,
+  `CONFIG_CLOCK_CONTROL_NRF_K32SRC_20PPM=y`로 정정(`prj.conf`). 이 값은 BLE
+  컨트롤러가 연결 이벤트마다 클럭 drift에 대비해 RX 윈도우를 얼마나 넓힐지
+  계산하는 데 쓰인다 — 지금까지는 실제보다 부정확한 크리스탈을 가정해 RX 윈도우를
+  필요 이상으로 넓게 열어 라디오 on-time과 전력을 낭비하고 있었을 가능성(안전하지만
+  비효율적인 방향의 오차). 8h 배터리 목표(§8)와 연결된 낮은 리스크 전력 최적화.
+  - **부수 발견(문서 오기 추정)**: `pinmap.md`의 HFXO 부품번호 `ECS-240-8-37CKM`은
+    ECS Inc. 명명 규칙상 24MHz 부품이다(32MHz는 `ECS-320-8-37CKM`) — nRF52832
+    HFXO는 반드시 32MHz여야 하고 BLE이 지금까지 정상 동작해온 정황상 실물은 32MHz가
+    맞을 가능성이 높다. 이전 LED3(950nm/980nm) 사례와 같은 유형의 **문서 오기로
+    추정** — 실물 보드 각인 확인 필요(TODO(open-item), `pinmap.md` §5에 기록).
+  - **빌드 검증 완료**: `west build -b nrf52dk/nrf52832 Application -p always`,
+    `version_MCUBOOT: "0.1.25+0"`, `.config`에서 `CONFIG_CLOCK_CONTROL_NRF_ACCURACY=20`
+    반영 확인, App Flash 74.29%/RAM 92.50%(변화 없음, 순수 설정값이라 코드 크기 영향
+    없음). **하드웨어 검증 미실시** — BLE 실측 전류소비 변화(AT-06)는 별도 확인 필요
+    (효과가 있더라도 매우 작을 것으로 예상, 리스크 낮은 정정 성격).
+
+## v0.1.31 (2026-09-28)
+
+- **[버그 수정] Watchdog이 SWD 디버거(RTT) 연동 중에만 오발동하던 문제 해결** —
+  사용자가 실기로 재현/제보: "BLE만 연동하면 안 걸리는데, RTT까지 같이 연동하면
+  Watchdog 리셋이 걸린다."
+  - **원인**: `m_ctrl.c watchdog_init()`이 `wdt_setup(dev, 0)`으로 옵션 없이 워치독을
+    세팅하고 있었다 — Zephyr nRF WDT 드라이버(`wdt_nrfx.c`) 확인 결과, `WDT_OPT_
+    PAUSE_HALTED_BY_DBG` 없이 세팅하면 `NRF_WDT_BEHAVIOUR_RUN_HALT_MASK`가 켜져서
+    **SWD 디버거가 코어를 halt시켜도 워치독 카운터가 계속 돈다.** RTT/디버그 세션이
+    붙어있으면 디버거가 짧게 코어를 halt하는 경우가 생기는데(메모리/변수 조회 등),
+    애플리케이션은 실제로 멈춘 적이 없어도 이 halt 시간들이 누적되면 4초
+    (`WATCHDOG_TIMEOUT_MS`)를 넘겨 워치독이 리셋시킨다 — 9/28 포화 테스트 로그에서
+    실제로 이 패턴 확인(포화 지속 중 로그 한 줄이 끊기면서 재부팅).
+  - **수정**: `wdt_setup(s_wdt_dev, WDT_OPT_PAUSE_HALTED_BY_DBG)`로 변경 — 디버거로
+    halt된 구간만 워치독 카운터도 같이 멈춘다. 디버거가 안 붙어있는 정상/양산
+    동작에서는 이 옵션이 전혀 영향을 주지 않아, "진짜로 멈춘 태스크 감지"라는
+    워치독 본래 목적은 그대로 유지된다 — 개발 편의성 개선이지 안전 기능 약화가
+    아니다.
+  - **빌드 검증 완료**: `west build -b nrf52dk/nrf52832 Application -p always`,
+    `version_MCUBOOT: "0.1.31+0"`, 에러 없음, App Flash 74.39%/RAM 92.50%(변화 없음).
+    **하드웨어 검증 미실시** — 다음 세션에서 RTT+BLE 동시 연동 상태로 포화 테스트를
+    재현해서 워치독 리셋이 더 이상 안 걸리는지 확인 필요.
+
+## v0.1.30 (2026-09-28)
+
+- **[전력 최적화] DCDC 레귤레이터 활성화** — 내부 전압 레귤레이터를 기본값 LDO에서
+  DCDC(벅 컨버터)로 전환. 보드에 이미 DCDC용 인덕터가 실장돼 있음을 `pinmap.md` §5로
+  재확인(L3/L4, pin47) — 하드웨어는 준비돼 있었고 소프트웨어에서 안 켜고 있었을 뿐.
+  데이터시트(nRF52832 PS) 기준 TX 전류가 거의 절반(0dBm 기준 LDO 11.6mA→DCDC
+  5.3mA, -8dBm 기준 8.4mA→3.8mA)으로 줄어든다 — §8 배터리 8h 목표와 직결.
+  - **시행착오**: `CONFIG_SOC_DCDC_NRF52X=y`를 prj.conf에 먼저 시도했으나 이 NCS
+    버전(Zephyr 4.4)에서 **deprecated(prompt 없는 내부 심볼)**라 `west build`가
+    Kconfig 에러로 즉시 거부(`is not directly user-configurable`) — devicetree로
+    설정하는 게 맞는 방식임을 확인(Kconfig help 텍스트에 명시돼 있었음).
+  - **정정 적용**: `Application/app.overlay`에 `&reg { regulator-initial-mode =
+    <NRF5X_REG_MODE_DCDC>; };` 추가. 생성된 `zephyr.dts`에서
+    `regulator-initial-mode = <0x1>`(DCDC)로 정확히 반영된 것 확인.
+  - **빌드 검증 완료**: `west build -b nrf52dk/nrf52832 Application -p always`,
+    `version_MCUBOOT: "0.1.30+0"`, 에러 없음, App Flash 74.39%/RAM 92.50%(변화 없음
+    — 레지스터 설정이라 코드 크기 영향 없음). **하드웨어 검증 완전 미실시** — 전원부
+    전체에 영향을 주는 변경이라 아래 검증 계획대로 반드시 실기 확인 필요.
+
+### DCDC 활성화 검증 계획 (하드웨어 필요, 전부 미실시)
+
+1. **전류소비 실측(AT-06, 가장 중요)** — 배터리 라인에 전류계(또는 Power Profiler
+   Kit II 등) 직렬 연결 후 DCDC on/off 두 빌드로 비교:
+   - BLE TX 순간 전류(peak): 데이터시트 예측치(0dBm 11.6mA→5.3mA)와 실측 대조
+   - 전체 평균 전류(정상 측정 사이클 기준): duty cycle 반영한 실제 배터리 수명 개선폭 확인
+2. **전압 리플/노이즈 확인** — 오실로스코프로 VDD 라인 확인, DCDC 스위칭 주파수
+   노이즈가 AS7341 I2C 신호나 ADC 판독값에 영향을 주는지(특히 낮은 광량 채널에서
+   노이즈 플로어 상승 여부) 확인
+3. **기능 회귀 확인** — I2C(AS7341 WHOAMI/SMUX/read_raw 정상), BLE(광고/연결/notify
+   정상), RTC tick 타이밍(100ms 정확도 유지) 전부 DCDC on 상태에서 재확인
+4. **BLE 연결 안정성** — 평소처럼 몇 분 이상 연결 유지하며 disconnect/재연결 이상
+   없는지(DCDC 스위칭 노이즈가 라디오에 영향 줄 가능성 배제)
+5. 4개 전부 이상 없으면 DCDC 확정, 문제 발견 시 `app.overlay`의 `&reg` 오버라이드만
+   제거하면 즉시 LDO로 롤백 가능(devicetree 한 블록이라 되돌리기 쉬움).
+
+## v0.1.29 (2026-09-28)
+
+- **[정정] RTT 로그 백엔드를 BLOCK→OVERWRITE 모드로 전환** — 사용자가 제공한 RTT
+  동작 원리 자료를 우리 NCS v3.4.0 실제 Kconfig(`log_backend_rtt.c`,
+  `Kconfig.rtt`)와 교차검증 후 반영.
+  - **발견**: `CONFIG_LOG_BACKEND_RTT_MODE`를 지금까지 한 번도 명시적으로 설정한 적이
+    없어 Zephyr 기본값인 `MODE_BLOCK`으로 동작 중이었음(`.config`로 확인) — 매 로그
+    메시지마다 최대 4회×5ms 재시도 후 드롭. `CONFIG_LOG_MODE_DEFERRED` 덕분에 이게
+    m_i2c/m_ble/m_ctrl 태스크를 막지는 않지만(로깅 전용 스레드만 재시도), J-Link
+    연결 없이 오래 방치하면 사실상 거의 모든 로그가 버려져 **"한참 뒤에 연결해서
+    그동안 쌓인 걸 본다"는 실사용 시나리오에서 버퍼에 남는 게 거의 없었음**.
+  - **수정**: `CONFIG_LOG_BACKEND_RTT_MODE_OVERWRITE=y`로 전환. 이 모드는
+    `SEGGER_RTT_WriteWithOverwriteNoLock()`을 직접 호출해(재시도 없이 즉시 기록)
+    버퍼가 차면 가장 오래된 로그부터 덮어쓴다 — 장시간 무인 방치(watchdog fault
+    injection/sensor fault recovery/배터리 자연방전 검증 등) 후 이상 발생 직전
+    로그를 보는 우리 용도에 정확히 맞음.
+  - **정정(사용자 제공 자료 대조)**: 제공된 자료의 `CONFIG_LOG_BACKEND_RTT_BUFFER_SIZE`
+    설정 제안은 우리 구성에는 적용되지 않음 — 이 옵션은 `LOG_BACKEND_RTT_BUFFER>0`
+    (전용 버퍼 인덱스)일 때만 적용되는데 우리는 기본 버퍼 인덱스 0을 그대로 쓰고
+    있어(`LOG_BACKEND_RTT_BUFFER=0`), 실제 버퍼 크기는 기존처럼
+    `CONFIG_SEGGER_RTT_BUFFER_SIZE_UP=4096`이 결정한다(변경 없음).
+  - 리셋/크래시 원인 자체는 이 변경과 무관하게 기존 `m_ctrl.c log_reset_cause()`
+    (RESETREAS 레지스터, 다음 부팅 시 확인)가 계속 담당 — RTT는 "전원 유지된 채
+    방치" 시나리오만 커버한다는 점은 그대로.
+  - **빌드 검증 완료**: `west build -b nrf52dk/nrf52832 Application -p always`,
+    `version_MCUBOOT: "0.1.29+0"`, 에러 없음, App Flash 74.39%(-128B, BLOCK 모드의
+    재시도 로직 제거)/RAM 92.50%(변화 없음). **하드웨어 검증 미실시** — 다음
+    세션에서 J-Link 없이 장시간 방치 후 연결해서 최근 로그가 실제로 남아있는지
+    확인 필요.
+
+## v0.1.28 (2026-09-28)
+
+- **[정리] 메모리/RAM 최적화 1차 — 저위험 항목만 실행**(`memory_ram_optimization_plan.md`
+  참고, `west build -t ram_report` 실측 기반 계획). 고위험 항목(mcumgr netbuf 축소,
+  OTA 재검증 필요)은 보류하고 이번엔 안전한 정리만 진행:
+  - **미사용 모듈 삭제**: `m_ble_batch.c`/`m_ble_batch.h` — `m_ble.c`가 이미 자체
+    배칭 로직(`s_batch`/`s_batch_count`)으로 완전히 대체했는데도 `CMakeLists.txt`에는
+    계속 남아있던 죽은 파일. 어디서도 호출되지 않는 것을 확인 후 파일과
+    `CMakeLists.txt` 참조 모두 제거.
+  - **해소된 TEMP_ 디버그 훅 3개 제거**: `TEMP_LED_STATIC_ALL_ON_TEST`(D3/D4 LED
+    미점등 진단, 2026-09-14 해결 완료), `TEMP_RTC_TICK_LOG_TEST`(RTC tick 100ms 실측,
+    검증 완료), `TEMP_BLE_DISABLE_TEST`(BLE 스택 격리 진단, 원인 확정 완료) — 전부
+    0으로 비활성화된 채 방치돼있던 초기 개발용 임시 코드였다. `config_app.h`의
+    매크로 정의와 `m_i2c.c`/`m_ble.c`의 `#if` 블록을 함께 제거.
+  - **유지한 것**: `TEMP_WATCHDOG_FAULT_INJECT_TEST`(AT-10 재사용 예정),
+    `TEMP_AS7341_READ_TEST`/`TEMP_AS7341_RAW_DBG_LOG`(이번 승인 범위 밖, 계획 문서에
+    후속 항목으로 기록만).
+  - **빌드 검증 완료**: `west build -b nrf52dk/nrf52832 Application -p always`,
+    `version_MCUBOOT: "0.1.28+0"`, 에러 없음, App Flash 74.45%/RAM 92.50%
+    (예상대로 변화 없음 — 코드 정리 목적이라 RAM 절감은 이번 항목의 목표가 아니었음,
+    가장 큰 절감 여지인 mcumgr netbuf는 고위험이라 보류). **하드웨어 검증 미실시.**
+
+## v0.1.27 (2026-09-28)
+
+- **[신규 기능] Sensor(AS7341) fault recovery 구현** — Gantt "Watchdog + sensor fault
+  recovery"(R3-1) 항목 중 watchdog(SoC 하드웨어 리셋)은 이미 완료돼 있었고 sensor fault
+  recovery만 남아있던 상태를 마무리.
+  - `m_i2c.c`에 `recover_as7341_or_escalate()` 추가 — AS7341 트리거/읽기 중 I2C 통신
+    실패(`MODULE_ERR_I2C_TIMEOUT`)가 발생하면 즉시 CTRL에 보고해 `CTRL_STATE_DEGRADED`
+    (단일고장 안전상태, 재부팅 전까지 래치)로 보내지 않고, 먼저 **재초기화**
+    (`m_i2c_as7341_init()` — WHOAMI 재확인+`i2c_recover_bus()`+SMUX 재구성)로 자체 복구를
+    시도한다. 재초기화 성공 시 이번 tick 샘플만 유실 처리하고 다음 tick부터 정상
+    복귀(gain/integration time도 재적용). 연속 실패가 `I2C_FAULT_RECOVERY_MAX_ATTEMPTS`
+    (=3)회 누적됐을 때만 진짜 하드웨어 고장으로 판단해 기존처럼 `CTRL_STATE_DEGRADED`로
+    에스컬레이션 — 단일고장 안전상태 래치 원칙은 그대로 유지하되, 일시적 I2C 글리치까지
+    영구 정지시키지는 않게 됨.
+  - 트리거 실패한 센서는 같은 tick에 읽기(read_raw)를 스킵해 같은 tick에 recovery를
+    두 번 시도하지 않도록 정리.
+  - **빌드 검증 완료**: `west build -b nrf52dk/nrf52832 Application -p always`,
+    `version_MCUBOOT: "0.1.27+0"`, 에러 없음, App Flash 74.45%(+344B)/RAM 92.50%
+    (변화 없음). **하드웨어 검증 미실시** — 다음 세션에서 AS7341 I2C 라인을 실제로
+    끊었다 붙이거나 일시적으로 방해해서 (1) 재초기화로 자동 복구되는지, (2) 3회
+    연속 실패 시 정확히 `CTRL_STATE_DEGRADED`로 래치되는지 확인 필요.
+
+## v0.1.26 (2026-09-28)
+
+- **[신규 기능] AS7341 STATUS2(ASAT/AVALID) 기반 포화 검출 구현** — Gantt "2. Acquisition
+  & Sync" §4번 항목(그동안 0%) 마무리. datasheet(DS000504 v3-00, §10 Figure 64, 페이지
+  44-45)를 직접 대조해 STATUS2(0xA3) 레지스터의 정확한 비트 위치를 확인:
+  bit4=ASAT_DIGITAL(적분시간 기준 카운터 최댓값 도달), bit3=ASAT_ANALOG(광량이 스펙트럴
+  아날로그 회로 적분 한계 초과) — 기존에 이미 검증돼 쓰이고 있던 bit6=AVALID와 함께
+  `m_i2c_as7341.h`에 추가.
+  - `m_i2c_as7341_read_raw()`에 `bool *out_saturated` 파라미터 추가(NULL 허용) —
+    AVALID가 선 그 순간의 STATUS2 바이트에서 ASAT_ANALOG/ASAT_DIGITAL을 함께 확인,
+    추가 I2C 트랜잭션 없이 채워준다.
+  - `m_i2c.c check_sensor_sanity()`를 정정 — 기존에는 raw count가 고정 임계값
+    (`AS7341_SATURATION_THRESHOLD=0xFFFF`)을 넘는지로 소프트웨어에서 포화를
+    판정했는데, 이 값은 게인/적분시간이 바뀌면 실제 풀스케일과 안 맞아 정확하지
+    않았다(architecture.md §11의 오래된 TODO). 이제는 하드웨어 ASAT 비트를 그대로
+    신뢰 — "채널별/게인별 정확한 풀스케일 계산" TODO 자체가 해소됨. `config_app.h`의
+    `AS7341_SATURATION_THRESHOLD` 매크로는 더 이상 쓰이지 않아 제거(LOW_SIGNAL
+    임계값은 STATUS2에 해당 비트가 없어 기존 소프트웨어 방식 그대로 유지).
+  - **빌드 검증 완료**: `west build -b nrf52dk/nrf52832 Application -p always`,
+    `version_MCUBOOT: "0.1.26+0"`, 에러 없음, App Flash 74.30%(+16B)/RAM 92.50%
+    (변화 없음). **하드웨어 검증 미실시** — 다음 세션에서 강한 광원으로 실제
+    포화(ASAT) 유발 시 `MODULE_ERR_SENSOR_SATURATION`이 정확히 판정되는지 확인
+    필요(architecture.md AT-04).
+

@@ -236,7 +236,8 @@ module_err_t m_i2c_as7341_trigger_measurement(m_i2c_as7341_dev_t *dev)
 	return MODULE_ERR_OK;
 }
 
-module_err_t m_i2c_as7341_read_raw(m_i2c_as7341_dev_t *dev, uint16_t raw_out[NIRS_WAVELENGTH_COUNT])
+module_err_t m_i2c_as7341_read_raw(m_i2c_as7341_dev_t *dev, uint16_t raw_out[NIRS_WAVELENGTH_COUNT],
+				    bool *out_saturated)
 {
 	if (dev == NULL || raw_out == NULL) {
 		return MODULE_ERR_INVALID_PARAM;
@@ -244,6 +245,10 @@ module_err_t m_i2c_as7341_read_raw(m_i2c_as7341_dev_t *dev, uint16_t raw_out[NIR
 
 	if (!dev->initialized) {
 		return MODULE_ERR_NOT_INITIALIZED;
+	}
+
+	if (out_saturated != NULL) {
+		*out_saturated = false;
 	}
 
 	/* 호출부가 m_i2c_as7341_trigger_measurement()를 이미 호출해뒀다고 가정 — 여기서는
@@ -261,6 +266,13 @@ module_err_t m_i2c_as7341_read_raw(m_i2c_as7341_dev_t *dev, uint16_t raw_out[NIR
 		}
 		if (status2 & AS7341_STATUS2_AVALID) {
 			valid = true;
+			/* AVALID가 선 바로 그 순간의 STATUS2 바이트에서 함께 확인 —
+			 * 이 값이 latch되는 채널 데이터(아래 CH0_DATA 읽기)와 동일 시점 기준
+			 * (datasheet §10.2.7 ASTATUS 설명과 동일 원리). 별도 I2C 트랜잭션 불필요. */
+			if (out_saturated != NULL &&
+			    (status2 & (AS7341_STATUS2_ASAT_ANALOG | AS7341_STATUS2_ASAT_DIGITAL))) {
+				*out_saturated = true;
+			}
 			break;
 		}
 		k_sleep(K_MSEC(1));

@@ -165,7 +165,17 @@ static void watchdog_init(void)
 		return;
 	}
 
-	int err = wdt_setup(s_wdt_dev, 0);
+	/* [버그 수정, 2026-09-28] WDT_OPT_PAUSE_HALTED_BY_DBG 없이 wdt_setup(dev, 0)을
+	 * 쓰면 nRF WDT 드라이버가 NRF_WDT_BEHAVIOUR_RUN_HALT_MASK를 세팅한다(wdt_nrfx.c) —
+	 * 즉 SWD 디버거가 코어를 halt시켜도 워치독 카운터가 계속 돈다. RTT/디버그 세션을
+	 * BLE 연동과 동시에 켜두면(사용자가 실기로 재현: RTT 연동 시에만 Watchdog 리셋
+	 * 발생, RTT 없이 BLE만 쓰면 재현 안 됨) 디버거의 짧은 halt들이 누적돼 4초를
+	 * 넘기면서 애플리케이션은 실제로 멈춘 적이 없는데도 워치독이 리셋시킨다. 이
+	 * 옵션을 켜면 디버거로 halt된 동안만 워치독 카운터가 같이 멈춘다 — 디버거가
+	 * 안 붙어있는 정상/양산 동작에서는 이 옵션이 아무 영향도 없다(원래 목적인
+	 * "진짜로 멈춘 태스크 감지"는 그대로 유지).
+	 */
+	int err = wdt_setup(s_wdt_dev, WDT_OPT_PAUSE_HALTED_BY_DBG);
 
 	if (err != 0) {
 		LOG_ERR("wdt_setup failed (err=%d)", err);

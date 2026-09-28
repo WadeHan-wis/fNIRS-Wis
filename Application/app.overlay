@@ -9,9 +9,19 @@
 #include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
 #include <zephyr/dt-bindings/pwm/pwm.h>
 #include <zephyr/dt-bindings/i2c/i2c.h>
+#include <zephyr/dt-bindings/regulator/nrf5x.h>
 
 &uicr {
 	nfct-pins-as-gpios;
+};
+
+/* 전력 최적화(2026-09-28): 내부 레귤레이터를 LDO(기본값)에서 DCDC로 전환 — pinmap.md
+ * §5에 실장이 확인된 DCDC 인덕터(L3/L4, pin47)를 실제로 활용한다. CONFIG_SOC_DCDC_NRF52X
+ * Kconfig는 이 NCS 버전에서 deprecated라 devicetree로 설정해야 한다(prj.conf 참고).
+ * 전원부 전체에 영향을 주는 변경이라 실기 전류소비/전압 리플/기능 회귀 검증 필요.
+ */
+&reg {
+	regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
 };
 
 /*

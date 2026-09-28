@@ -80,6 +80,16 @@ LFCLK → RTC(100ms event) → ISR(timestamp+semaphore만)
 - LED sequencing/광 획득 내부의 us~ms 정밀 타이밍이 필요한 구간에서만 **HF TIMER 또는 DPPI/PPI**를 국소적으로 사용한다 (RTC wake 이후 필요할 때만 HFCLK enable).
 - 예상 시퀀스: `RTC CC 인터럽트(보정된 tick) → (필요시) HFCLK enable → LED PWM sequence → AS7341 acquisition → peripheral idle → sleep`
 - 구현 후 반드시 오실로스코프/로직분석기로 장시간(수십분~1시간) 실측해 보정 없는 경우 대비 누적 drift가 얼마나 줄었는지 검증한다.
+- **클럭 정확도(ppm) 선언 정정(2026-09-28, v0.1.25)** — LFCLK 소스 자체는 처음부터
+  `CONFIG_CLOCK_CONTROL_NRF_K32SRC_XTAL`(외부 크리스탈)로 맞았으나, BLE 컨트롤러에
+  선언하는 정확도(ppm) 값은 Zephyr 기본값인 50ppm으로 방치돼 있었다. 실제 실장
+  LFXO(`pinmap.md` §5, ECS-.327-12.5-12-TR) 데이터시트 기준 ±20ppm으로 확인,
+  `CONFIG_CLOCK_CONTROL_NRF_K32SRC_20PPM`으로 정정(`prj.conf`). BLE 연결 이벤트마다
+  RX 윈도우를 클럭 drift 마진만큼 넓히는데, 실제보다 부정확한 값을 가정해온 만큼
+  라디오 on-time/전력을 필요 이상 썼을 가능성이 있음(§6/§8 배터리 목표와 연결,
+  안전하지만 비효율적인 방향의 오차였음). 이 조사 중 `pinmap.md`의 HFXO 부품번호
+  (`ECS-240-8-37CKM`)가 명명 규칙상 24MHz 부품으로 보여 32MHz 부품(`ECS-320-8-37CKM`)
+  표기 오류로 추정된다는 점도 함께 발견 — 실물 보드 각인 확인 필요(TODO(open-item)).
 
 ### 2.4 BLE 파라미터 구조 — ✅ S2 계승
 
@@ -179,6 +189,15 @@ Gain/Integration Time은 **초기 검증 단계에서는 고정**한다 (런타�
 전력 최적화 우선순위: **① LED PWM duty cycle → ② BLE packet batching → ③ CPU sleep/Zephyr PM → ④ Peripheral runtime PM**
 
 Ring Buffer로 BLE가 5~10초 막혀도 데이터 유실 없이 버퍼를 유지하는 것이 초기 목표다 (§2.5).
+
+**DCDC 레귤레이터 활성화(2026-09-28, v0.1.30)** — 위 우선순위와 별개로 챙길 수 있는
+레귤레이터 레벨 최적화. 내부 전압 레귤레이터를 기본값 LDO에서 DCDC(벅 컨버터)로
+전환(`Application/app.overlay` `&reg` 노드) — 보드에 이미 DCDC용 인덕터가 실장돼
+있음을 확인(§5 대신 pinmap.md §5 참고)하고 소프트웨어에서 활용하지 않고 있던 것을
+켠 것. 데이터시트 기준 TX 전류가 거의 절반(0dBm 11.6mA→5.3mA)으로 줄어든다. 빌드
+검증 완료, **전류소비/전압 리플/기능 회귀 하드웨어 검증 전부 미실시**(CHANGELOG.md
+v0.1.30 검증 계획 참고) — 전원부 전체에 영향을 주는 변경이라 §8 목표에 반영하는 건
+실기 확인 이후로 미룬다.
 
 ## 7. Thermal 안전 설계 (원칙 확정, 세부 수치는 보류)
 
@@ -439,6 +458,28 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
          **펌웨어 변경 불필요** — 기존 AS7341_CONFIG(LED 듀티 write) 경로로 앱에서
          그대로 적용 가능. 상세 구현 스펙은 `app_handoff_led_calibration_context.md`
          참고. 다음 단계: 3개 프리셋 하루씩 raw 데이터 수집 후 비교·채택.
+       - **7차: 프리셋 실측 비교 완료, 매뉴얼 조합 채택 확정(2026-09-28)** — 9/24
+         (매뉴얼 25/50/75%) / 9/25(프리셋 A, 9/22/100%) / 9/26(매뉴얼) 3박 수면
+         데이터로 비교한 결과, "정답인 조합은 없다"고 판단(사용자 결정) — 향후
+         동등성 검증은 **매뉴얼 조합(25/50/75%)으로 고정 운용**하기로 확정, 프리셋
+         튜닝 작업은 이걸로 종료한다.
+       - **8차: Ambient light 제거(dark-frame subtraction) 도입(2026-09-28,
+         v0.1.24)** — 위 3박 raw 데이터 비교 중 재확인된 "레퍼런스는 50%가 다크
+         프레임인데 우리는 다크 프레임 자체가 없어 raw 정의가 다르다"는 문제에
+         대응. lit `DARK_FRAME_LIT_INTERVAL`(=10)개마다 LED 전부 OFF + lit과 동일한
+         gain/ATIME/ASTEP으로 다크 프레임 1개를 추가 측정(`m_i2c.c
+         acquire_one_dark_sample()`). AS7341이 적분시간에 선형 비례하는 누적연산임을
+         이미 실측 확인해뒀기 때문에(9/23, 적분 5배→count 5.2배) 앱은 스케일링 없이
+         `lit_raw - dark_raw`만 하면 된다. lit:dark ≈ 10:1 비율로 제한한 이유는
+         다크(주변광/dark current)가 생리신호보다 훨씬 느리게 변해 1:1로 잴 필요가
+         없고, 이러면 데이터량/BLE 전력 증가를 약 +10%로 제한할 수 있어서다(사용자
+         결정) — `RING_BUFFER_CAPACITY`는 정적 배열이라 이 정도 증가는 재조정
+         불필요. BLE 프로토콜 v3→v4: 배칭 레코드 길이는 그대로 두고 `seq_num`의
+         bit31을 다크 프레임 플래그로 재사용(신규 필드 없음) — 앱 대응 스펙은
+         `app_handoff_dark_frame_context.md` 참고. **빌드 검증 완료**(clean pristine
+         rebuild, `version_MCUBOOT: "0.1.24+0"`, App Flash 74.29%/RAM 92.50% — RAM
+         변화 없음). **하드웨어 검증 미실시** — 다음 세션에서 완전 암실 다크값 안정성 +
+         앱 v4 파서 반영 후 레퍼런스 재비교 필요.
 
 6. **Safety 인증(IEC 60601-1/-1-8) 대응 필수 펌웨어 안전기능 갭 (2026-09-17 확인)**
    — 의료기기 safety 인증 시험 성적을 위한 필수 요구사항 검토 중 발견. 현재 펌웨어에 아래 항목이
@@ -462,6 +503,16 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
        재부팅 전까지 측정 영구 정지. `-ENOTCONN`/`-EINVAL`과 같은 "무해한 전달 실패"로
        재분류하고 congestion 감지 시 짧게 backoff하도록 수정. 하드웨어 검증 필요(실물
        backlog flush에서 `-ENOMEM`이 실제로 재현되는지, 래치 없이 정상 flush되는지).
+       **개선(2026-09-28, v0.1.27, Sensor fault recovery)**: 같은 계열의 문제를
+       AS7341 I2C 통신 실패에도 적용 — 예전에는 트리거/읽기 I2C 에러가 나면 즉시
+       `CTRL_STATE_DEGRADED`로 래치했는데, 이는 재연결 가능한 일시적 I2C 글리치까지
+       영구 정지시키는 과잉 대응이었다. `m_i2c.c recover_as7341_or_escalate()`가
+       I2C 에러 발생 시 먼저 AS7341 재초기화(WHOAMI+SMUX 재구성+`i2c_recover_bus()`)로
+       자체 복구를 시도하고, 연속 `I2C_FAULT_RECOVERY_MAX_ATTEMPTS`(=3)회 복구 실패
+       시에만 진짜 하드웨어 고장으로 판단해 기존처럼 `CTRL_STATE_DEGRADED`로
+       에스컬레이션하도록 정정 — 단일고장 안전상태 래치 원칙 자체는 유지. 빌드 검증
+       완료(`version_MCUBOOT: "0.1.27+0"`), **하드웨어 검증(I2C 라인 실제 차단/복구
+       시나리오) 미실시**.
      - Watchdog 리셋 후 안전 재시작 시퀀스 — **2026-09-17 실기 검증 완료** (`m_ctrl.c
        log_reset_cause()`가 RESETREAS로 watchdog 리셋 여부를 로그 — CHANGELOG v0.0.14 §2).
        `TEMP_WATCHDOG_FAULT_INJECT_TEST`로 m_i2c 태스크를 고의로 hang시켜 실기로
@@ -472,6 +523,14 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
        상태 복구" 로직 자체가 불필요 — GPREGRET 기반 상태 복원은 **채택하지 않기로
        결정**(복원할 위험한 중간 상태가 애초에 없음). §3의 "GPREGRET 상태보존" 항목은
        LED 디밍 등 다른 맥락 용도로 남겨둔다.
+       **버그 수정(2026-09-28, v0.1.31)**: 사용자가 실기로 "BLE만 연동하면 안 걸리는데
+       RTT까지 같이 연동하면 워치독 리셋이 걸린다"를 재현/제보 — 원인은
+       `watchdog_init()`이 `wdt_setup(dev, 0)`으로 `WDT_OPT_PAUSE_HALTED_BY_DBG` 없이
+       세팅해서, SWD 디버거가 코어를 halt시키는 동안에도 워치독 카운터가 계속 돌고
+       있었기 때문(`wdt_nrfx.c` 확인 — 이 옵션 없으면 `NRF_WDT_BEHAVIOUR_RUN_HALT_
+       MASK` 세팅됨). `wdt_setup(dev, WDT_OPT_PAUSE_HALTED_BY_DBG)`로 수정 — 디버거
+       미연결 상태(정상/양산 동작)에는 영향 없이, 디버깅 중 오발동만 해소. 빌드
+       검증 완료, **하드웨어 검증(RTT+BLE 동시 연동 상태로 재현 테스트) 미실시**.
      - BLE 연결 끊김 시 로컬 버퍼링 지속 + 장시간 미연결 시 저전력 대기모드 — **코드 작성
        완료**(CHANGELOG v0.0.14 §3). 구현 중 실제 버그 발견: `m_ble.c`가 끊김 중에도 계속
        pop해서 즉시 폐기하고 있어 "버퍼링"이 이름뿐이었음 — 연결 중에만 pop하도록 수정.
@@ -518,6 +577,15 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
        SATURATION은 강한 광원 필요 — 재현 안 되면 코드 리뷰로 대체 후 그 사실을 기록).
        **실기 검증은 SWD 연결 불안정으로 2026-09-18에 다음으로 연기** — 항목5-[2]와
        동일한 사유, 코드/로그는 준비된 상태.
+       **정정(2026-09-28, v0.1.26)**: SATURATION 판정을 고정 임계값(raw count 방식)에서
+       **AS7341 STATUS2(0xA3)의 ASAT_ANALOG(bit3)/ASAT_DIGITAL(bit4) 하드웨어 비트**
+       기반으로 교체 — datasheet(DS000504 v3-00 §10, Figure 64)를 직접 대조해 정확한
+       비트 위치를 확인했다(bit6 AVALID는 기존에 이미 검증돼 쓰이던 값과 일치 확인).
+       하드웨어가 게인/적분시간과 무관하게 직접 판정하므로 위 "채널별/게인별 정확한
+       풀스케일 계산" TODO 자체가 해소됨(`config_app.h`의 `AS7341_SATURATION_THRESHOLD`
+       매크로는 제거). LOW_SIGNAL은 STATUS2에 해당 비트가 없어 기존 소프트웨어 방식
+       그대로 유지. 빌드 검증 완료(`version_MCUBOOT: "0.1.26+0"`), **하드웨어 검증
+       (강한 광원으로 실제 ASAT 유발)은 여전히 미실시**.
      - 재연결 후 데이터 gap 식별 — **정정(2026-09-17): 여전히 미구현**. `nirs_sample_t.seq_num`을
        부팅 세션 내내 리셋 없이 단조증가로 유지하도록 변경(`reset_to_device_on()`의
        `s_seq_num = 0` 제거)까지는 했으나, **`m_ble_proto_encode_sample()`이 만드는
@@ -680,6 +748,16 @@ Rev0~3(+OTA)는 **17근무일**(2026-09-14~10-12, 공휴일 제외)로 일정이
    {PATCH}` 형식으로 변경 — 앱이 스캔/연결 시 이름만으로 펌웨어 버전을 구분할 수
    있게 함. Kconfig 문자열이라 자동 대입이 안 돼, **매 패치 버전 상승마다 VERSION
    파일/`config_app.h`와 함께 수동 갱신하는 정책**으로 확정(`prj.conf`에 명시).
+
+9. **TODO(open-item, 2026-09-28): BLE 패킷에 진단 정보(sample->status 등) 추가 검토**
+   — PoC v1 보드는 UART 핀이 없고 SWD 접촉도 불안정해(항목6-[2] 참고), 앱 연동 중
+   RTT로 실시간 진단하기가 사실상 불가능하다는 게 반복 확인됨(2026-09-28 STATUS2
+   포화검출 검증 세션). 대안으로 (1) `nirs_sample_t.status`(module_err_t, 지금은
+   BLE로 전송 안 됨)를 배칭 레코드에 1바이트로 추가, (2) 리셋 원인을 GPREGRET류
+   유지 메모리에 저장해 다음 부팅 시 characteristic으로 노출, (3)
+   `AS7341_DROPPED_COUNT` 패턴처럼 saturation/i2c 에러 누적 카운터 characteristic
+   추가 — 3가지를 검토 중. 이미 예정된 "데이터 패킷 포맷 공식 문서화" 작업과 묶어서
+   진행 예정, 아직 구현 착수 안 함.
 
 ### 다음 보드 리비전 반영 예정 (하드웨어 개선 항목, 확정됨 — 일정만 대기)
 - **LED3 파장 부품 교체**: 스펙(§0/§5/§9)은 950nm이나, PoC v1 보드(`SCH_fNIRS_Sleep_Project.pdf`) 실장 부품은

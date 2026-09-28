@@ -49,7 +49,15 @@ extern "C" {
 #define AS7341_ENABLE_SP_EN   BIT(1)
 #define AS7341_ENABLE_SMUXEN  BIT(4)
 
-#define AS7341_STATUS2_AVALID BIT(6)
+#define AS7341_STATUS2_AVALID       BIT(6)
+/* STATUS2(0xA3) 포화 비트 (datasheet DS000504 v3-00 §10, Figure 64 실측 대조 확인,
+ * 2026-09-28) — ASAT_DIGITAL: 적분시간(ATIME) 기준 카운터 최댓값 도달(디지털 포화).
+ * ASAT_ANALOG: 광량이 스펙트럴 아날로그 회로의 적분 한계를 초과(아날로그 포화, 게인/
+ * 적분시간과 무관하게 하드웨어가 직접 판정). 둘 중 하나라도 서면 그 순간의 12개
+ * 채널 데이터 전부가 포화 상태로 간주된다(§10.2.7 ASTATUS 설명과 동일 원리).
+ */
+#define AS7341_STATUS2_ASAT_DIGITAL BIT(4)
+#define AS7341_STATUS2_ASAT_ANALOG  BIT(3)
 
 #define AS7341_ID_EXPECTED_MASK  0xFC
 #define AS7341_ID_EXPECTED_VALUE 0x24
@@ -105,10 +113,17 @@ module_err_t m_i2c_as7341_trigger_measurement(m_i2c_as7341_dev_t *dev);
 /* 채널별 raw intensity 1회 읽기 (3파장 raw_out[NIRS_WAVELENGTH_COUNT]에 채움).
  * 호출 전 반드시 m_i2c_as7341_trigger_measurement()로 이번 사이클을 트리거해뒀어야
  * 한다 — 이 함수는 AVALID 폴링(적분 완료 대기)과 채널 읽기만 수행한다.
- * 포화/저신호 감지 시 MODULE_ERR_SENSOR_SATURATION / MODULE_ERR_SENSOR_LOW_SIGNAL 반환.
- * TODO(open-item): 채널별 saturation 임계 게인 실측 필요 (architecture.md §11).
+ *
+ * out_saturated(2026-09-28, NULL 허용): AVALID가 선 순간 같은 STATUS2 바이트에서
+ * ASAT_ANALOG/ASAT_DIGITAL 비트를 함께 확인해 채워준다 — 별도 I2C 트랜잭션 추가 없이
+ * 하드웨어가 직접 판정한 포화 여부를 얻는다(게인/적분시간이 바뀌어도 임계값을 다시
+ * 계산할 필요 없음, TODO(open-item)였던 "채널별 saturation 임계 게인 실측"을
+ * 대체한다). 호출부(m_i2c.c)가 이 값을 근거로 MODULE_ERR_SENSOR_SATURATION을 판정한다
+ * — 저신호(LOW_SIGNAL)는 STATUS2에 해당 비트가 없어 여전히 raw count 소프트 임계값으로
+ * 판정한다.
  */
-module_err_t m_i2c_as7341_read_raw(m_i2c_as7341_dev_t *dev, uint16_t raw_out[NIRS_WAVELENGTH_COUNT]);
+module_err_t m_i2c_as7341_read_raw(m_i2c_as7341_dev_t *dev, uint16_t raw_out[NIRS_WAVELENGTH_COUNT],
+				    bool *out_saturated);
 
 #ifdef __cplusplus
 }

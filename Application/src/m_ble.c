@@ -251,11 +251,6 @@ static module_err_t ble_init(void)
 		m_ctrl_notify_alive(CTRL_ALIVE_BLE);
 	}
 
-#if TEMP_BLE_DISABLE_TEST
-	LOG_WRN("TEMP_BLE_DISABLE_TEST=1 — bt_enable() 건너뜀 (AS7341/RTC 격리 진단용)");
-	return MODULE_ERR_OK;
-#endif
-
 	int err = bt_enable(NULL);
 
 	if (err != 0) {

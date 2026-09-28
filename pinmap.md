@@ -90,8 +90,8 @@ P1은 2핀 헤더 — SWDCLK/SWDIO만 나와 있고 VDD/GND는 별도 확인 필
 
 | 항목 | MCU 핀 | 부품 | 비고 |
 |---|---|---|---|
-| LFXO (32.768kHz) | XL1=P0.00(pin2), XL2=P0.01(pin3) | X1, ECS-.327-12.5-12-TR | RTC 100ms 타이밍(architecture.md §2.3)의 기준 클럭 |
-| HFXO (32MHz) | XC1(pin34), XC2(pin35) | X2, ECS-240-8-37CKM | |
+| LFXO (32.768kHz) | XL1=P0.00(pin2), XL2=P0.01(pin3) | X1, ECS-.327-12.5-12-TR | RTC 100ms 타이밍(architecture.md §2.3)의 기준 클럭, 데이터시트 정확도 ±20ppm(2026-09-28 확인, `prj.conf` `CONFIG_CLOCK_CONTROL_NRF_K32SRC_20PPM` 반영) |
+| HFXO (32MHz) | XC1(pin34), XC2(pin35) | X2, ECS-240-8-37CKM | ⚠️TODO(open-item, 2026-09-28): 부품번호 `ECS-240-8-37CKM`은 ECS Inc. 명명 규칙상 **24MHz** 부품이다(32MHz는 `ECS-320-8-37CKM`) — nRF52832는 HFXO가 정확히 32MHz여야 하는데(구성 불가 값) BLE이 정상 동작해온 정황상 실장 부품은 32MHz가 맞을 가능성이 높다. **이 문서의 부품번호가 오기(LED3 950nm↔980nm 사례와 동일 유형)로 추정** — 실물 보드에서 각인된 부품번호를 직접 확인해 정정 필요. |
 | BLE 안테나 | ANT (pin30) | E1 칩안테나 + L1/L2/C3 매칭망 | 50Ω 임피던스 매칭, Altium 노트에 라인폭 규격 명시됨 |
 | DC/DC (DCC) | pin47 | L3(15nH)+L4(10uH) | nRF52832 내부 벅 컨버터용 인덕터 |
 

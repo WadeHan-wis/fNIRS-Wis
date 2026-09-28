@@ -6,6 +6,7 @@
 #define NIRS_SAMPLE_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "config_app.h"
 #include "module_err.h"
 
@@ -29,6 +30,13 @@ typedef struct {
 	module_err_t status;       /* 포화/저신호/센서 오류 flag 등 */
 
 	uint16_t fw_version;
+
+	/* Ambient light 제거(dark-frame subtraction, 2026-09-28) — true면 LED 전부 OFF 상태로
+	 * 측정한 다크 프레임(주변광+dark current만 포함, led_duty는 전부 0). 앱/PC가
+	 * lit_raw - dark_raw로 순수 LED 신호를 구한다(§4 RAW 보존 원칙 — 펌웨어는 빼지 않는다).
+	 * BLE 배칭 레코드에는 이 필드 대신 seq_num의 MSB로 인코드된다(m_ble_proto.c 참고,
+	 * BLE_PROTOCOL_VERSION 4). */
+	bool is_dark;
 } nirs_sample_t;
 
 #ifdef __cplusplus

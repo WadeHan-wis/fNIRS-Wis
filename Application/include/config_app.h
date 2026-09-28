@@ -20,7 +20,7 @@ extern "C" {
  */
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 1
-#define FW_VERSION_PATCH 23
+#define FW_VERSION_PATCH 31
 
 /* nirs_sample_t.fw_version(uint16_t)에 담기 위한 패킹: MAJOR(4bit)|MINOR(4bit)|PATCH(8bit) */
 #define FW_VERSION_PACKED \
@@ -99,8 +99,9 @@ typedef enum {
 /* TEMP(하드웨어 진단용, 2026-09-14): D3/D4 미점등 원인 파악을 위해 1이면 순차 점등 대신
  * 3개 LED를 100% duty로 계속 켜둔다(타이밍 걱정 없이 멀티미터로 측정 가능).
  * 진단(R17/R20 2.7V 동일, D4 육안 확인) 완료 — 순차 점등 모드로 복귀.
+ * [정리, 2026-09-28] 진단 완료 후 오래 방치돼있던 훅이라 플래그/사용처를 제거했다
+ * (memory_ram_optimization_plan.md 항목3).
  */
-#define TEMP_LED_STATIC_ALL_ON_TEST 0
 
 /* BLE 연동 성공 점멸 횟수. 점멸 토글은 RTC 100ms tick을 그대로 사용한다
  * (토글 1회=100ms, 점멸 1회=on+off=2 tick=200ms → 10회 점멸 = 2초).
@@ -130,19 +131,11 @@ typedef enum {
  */
 #define TEMP_AS7341_READ_TEST 0
 
-/* TEMP(개발용, 2026-09-15): RTC 100ms ISR → I2C Task wake 주기 실측 검증용.
- * 1이면 세마포어로 깨어날 때마다 RTC 타임스탬프를 로그로 찍어 tick 간격이 실제로
- * ~100ms인지 확인할 수 있다. 트래커 "Zephyr Task RTC Timer로 100ms ISR 구현" 항목의
- * 검증 방식(ISR 디버깅 로그 확인)에 대응. 검증 끝나면 0으로 되돌린다.
+/* [정리, 2026-09-28] RTC tick 주기 실측(TEMP_RTC_TICK_LOG_TEST)과 BLE 스택 격리 진단
+ * (TEMP_BLE_DISABLE_TEST) 훅은 둘 다 2026-09-15 당시 문제를 검증/해결한 뒤 0으로
+ * 방치돼있던 초기 개발용 임시 코드라 플래그/사용처를 제거했다
+ * (memory_ram_optimization_plan.md 항목3).
  */
-#define TEMP_RTC_TICK_LOG_TEST 0
-
-/* TEMP(하드웨어 진단용, 2026-09-15): BLE 스택(bt_enable) 추가 후 AS7341(NIR1) SMUX
- * 구성 성공 로그가 안 보이고 부팅이 특정 지점에서 멈추는 문제 격리용. 1이면
- * m_ble.c가 bt_enable()/advertising을 건너뛰어 BLE 없이 AS7341/RTC가 정상 동작
- * 하는지만 확인한다. 원인 확정 후 0으로 되돌린다.
- */
-#define TEMP_BLE_DISABLE_TEST 0
 
 /* TEMP(개발용, 2026-09-16): 테스트 APK로 수신되는 DATA0/DATA1 raw 값이 AS7341이 실제로
  * 읽은 값과 일치하는지 검증하기 위해, RTT 로그(m_i2c_as7341.c의 F5~NIR LOG_DBG)를
@@ -161,6 +154,16 @@ typedef enum {
 #define WATCHDOG_TIMEOUT_MS 4000
 #define WATCHDOG_ALIVE_STALE_MS 1000
 #define WATCHDOG_CHECK_PERIOD_MS 500
+
+/* --- Sensor(AS7341) fault recovery (Rev3 R3-1, 2026-09-28) ---
+ * I2C 트리거/읽기 실패(MODULE_ERR_I2C_TIMEOUT) 시 하드웨어 watchdog(위)이 SoC 전체를
+ * 리셋할 때까지 기다리지 않고, 먼저 AS7341 재초기화(WHOAMI+SMUX 재구성, i2c_recover_bus
+ * 포함 — m_i2c_as7341_init() 참고)로 자체 복구를 시도한다. 연속 실패가 이 횟수에
+ * 도달해야만 진짜 하드웨어 고장으로 판단해 CTRL_STATE_DEGRADED(단일고장 안전상태,
+ * 재부팅 전까지 래치)로 에스컬레이션한다 — 일시적 I2C 글리치까지 영구 정지시키지
+ * 않기 위함(m_i2c.c recover_as7341_or_escalate() 참고).
+ */
+#define I2C_FAULT_RECOVERY_MAX_ATTEMPTS 3
 
 /* TEMP(watchdog 실기 fault injection 테스트용, 2026-09-17): 1이면 m_i2c 태스크가
  * 부팅 후 TEMP_WATCHDOG_FAULT_INJECT_TICKS번째 tick에서 완전히 멈춘다(m_ctrl_notify_alive
@@ -192,14 +195,23 @@ typedef enum {
 #define BLE_STANDBY_BLINK_ON_TICKS 1
 
 /* Safety 인증 대응(2026-09-17, architecture.md §11 항목6-[4]): AS7341 채널 raw 값
- * sanity check 임계값. SATURATION은 16bit ADC 하드 한계(0xFFFF)로 판정하고, LOW_SIGNAL은
- * 노이즈 플로어 근접값으로 판정한다. TODO(open-item): 채널별/게인별 정확한 풀스케일 계산은
- * architecture.md §11의 gain/ATIME 실측 캘리브레이션 항목과 함께 재확정 필요 — 지금은
- * 코드 전체에 정의만 있고 아무도 판정하지 않던 SATURATION/LOW_SIGNAL 상태를 실제로
- * 채우는 것이 목적이라 보수적인 고정 임계값을 사용한다.
+ * sanity check 임계값. LOW_SIGNAL은 노이즈 플로어 근접값으로 판정한다.
+ * [정정, 2026-09-28] SATURATION은 더 이상 이 고정 임계값으로 판정하지 않는다 —
+ * AS7341 STATUS2의 ASAT_ANALOG/ASAT_DIGITAL 비트(하드웨어가 게인/적분시간과 무관하게
+ * 직접 판정, m_i2c_as7341.c read_raw()/m_i2c.c check_sensor_sanity() 참고)로 대체돼
+ * "채널별/게인별 정확한 풀스케일 계산" TODO 자체가 해소됐다.
  */
-#define AS7341_SATURATION_THRESHOLD 0xFFFF
 #define AS7341_LOW_SIGNAL_THRESHOLD 10
+
+/* --- Ambient light 제거(dark-frame subtraction, 2026-09-28) ---
+ * lit(정상 측정) 샘플 DARK_FRAME_LIT_INTERVAL개마다 다크 프레임(LED 전부 OFF, 같은
+ * gain/ATIME/ASTEP)을 1개 추가로 삽입한다. 다크(주변광+dark current)는 생리신호(맥동)보다
+ * 훨씬 느리게 변하므로 lit과 1:1로 잴 필요가 없다 — 10:1 비율이면 데이터량/전력 증가를
+ * 약 +10%로 제한하면서도 오프셋 추적에는 충분하다(사용자 결정, 2026-09-28).
+ * lit 샘플레이트/ring buffer 용량(RING_BUFFER_CAPACITY, 위 §2.5)에는 영향 없음 — 정적
+ * 배열 크기가 아니라 실제 push 빈도만 소폭(+10%) 늘어나는 것이라 기존 용량 여유로 흡수된다.
+ */
+#define DARK_FRAME_LIT_INTERVAL 10
 
 #ifdef __cplusplus
 }

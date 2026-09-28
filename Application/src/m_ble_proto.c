@@ -89,9 +89,18 @@ uint16_t m_ble_proto_encode_batch(nir_sensor_id_t sensor_id, const nirs_sample_t
 		const nirs_sample_t *sample = &samples[i];
 
 		/* v2(2026-09-21)에서 도입한 순서(NCS_TedreamS2 관례 계승) 그대로,
-		 * v3에서는 이 레코드가 배치 헤더 뒤로 여러 개 이어질 뿐이다. */
+		 * v3에서는 이 레코드가 배치 헤더 뒤로 여러 개 이어질 뿐이다.
+		 * v4(2026-09-28): seq_num의 bit31을 다크 프레임 플래그로 인코드한다
+		 * (m_ble_proto.h 참고) — 내부 s_seq_num 카운터 자체는 건드리지 않고
+		 * wire로 나가는 값만 여기서 마스킹/플래그 처리한다. */
+		uint32_t wire_seq = sample->seq_num & BLE_PROTO_SEQ_NUM_MASK;
+
+		if (sample->is_dark) {
+			wire_seq |= BLE_PROTO_SEQ_DARK_FLAG_BIT;
+		}
+
 		sys_put_le32(sample->timestamp_us, &out_buf[offset]);
-		sys_put_le32(sample->seq_num, &out_buf[offset + 4]);
+		sys_put_le32(wire_seq, &out_buf[offset + 4]);
 
 		/* Red630/Red680/NIR, 전부 u16 LE. raw_out 매핑은 m_i2c_as7341.c에서
 		 * 이미 640NM=F7(~630nm)/680NM=F8(680nm)/950NM=NIR로 확정. */

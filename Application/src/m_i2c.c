@@ -20,6 +20,13 @@ static uint32_t s_seq_num;
 static uint16_t s_fixed_gain;
 static uint16_t s_fixed_integration_time;
 
+/* Sensor fault recovery(2026-09-28) — 센서별 연속 I2C 실패 횟수. 성공하면 0으로 리셋. */
+static uint8_t s_i2c_fault_streak[NIR_SENSOR_COUNT];
+
+/* Ambient light 제거(dark-frame subtraction, 2026-09-28) — lit push 횟수를 세다가
+ * DARK_FRAME_LIT_INTERVAL마다 다크 프레임 1개를 추가로 push한다(config_app.h 참고). */
+static uint16_t s_dark_frame_tick_counter;
+
 /* NIR1(&i2c1)/NIR2(&i2c0) — pinmap.md §3, 각각 독립 I2C 버스에 실장된 AS7341 2개. */
 static m_i2c_as7341_dev_t s_as7341[NIR_SENSOR_COUNT];
 
@@ -226,9 +233,6 @@ static module_err_t i2c_init(void)
 	s_led_mode = I2C_LED_MODE_ACQUISITION;
 	m_i2c_led_all_off();
 	return MODULE_ERR_OK;
-#elif TEMP_LED_STATIC_ALL_ON_TEST
-	/* TEMP(하드웨어 진단): 3개 전부 100% duty로 고정 — D3/D4 미점등 원인 확인용 */
-	return m_i2c_led_all_on(1000);
 #else
 	m_i2c_led_all_off();
 	return m_i2c_led_set_duty((nirs_wavelength_t)s_device_on_led_index,
@@ -242,13 +246,17 @@ static module_err_t i2c_init(void)
  * TODO(open-item): 채널별/게인별 정확한 풀스케일 계산은 architecture.md §11의 gain/ATIME
  * 실측 캘리브레이션과 함께 재확정 — 지금은 보수적 고정 임계값(config_app.h) 사용.
  */
-static module_err_t check_sensor_sanity(const nirs_sample_t *sample)
+static module_err_t check_sensor_sanity(const nirs_sample_t *sample,
+					 const bool hw_saturated[NIR_SENSOR_COUNT])
 {
+	/* 포화 판정(2026-09-28 정정) — 예전엔 raw count가 고정 임계값(AS7341_SATURATION_
+	 * THRESHOLD=0xFFFF)을 넘는지로 소프트웨어에서 판정했는데, 이 임계값은 게인/적분
+	 * 시간이 바뀌면 실제 풀스케일과 안 맞아 정확하지 않았다(TODO(open-item)였음). 이제는
+	 * AS7341 STATUS2의 ASAT_ANALOG/ASAT_DIGITAL 비트(하드웨어가 게인/적분시간과 무관하게
+	 * 직접 판정, m_i2c_as7341.c read_raw() 참고)를 그대로 신뢰한다. */
 	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
-		for (int wl = 0; wl < NIRS_WAVELENGTH_COUNT; wl++) {
-			if (sample->raw[i][wl] >= AS7341_SATURATION_THRESHOLD) {
-				return MODULE_ERR_SENSOR_SATURATION;
-			}
+		if (hw_saturated[i]) {
+			return MODULE_ERR_SENSOR_SATURATION;
 		}
 	}
 
@@ -270,7 +278,47 @@ static bool is_gate_active_tick(void)
 	return (s_gate_tick_count % s_gate_cycle_ticks) < s_gate_active_ticks;
 }
 
-static void acquire_one_sample(nirs_sample_t *sample)
+/* AS7341 I2C 통신 실패(트리거/읽기 도중) 시 호출 — 즉시 CTRL에 보고해 안전상태로
+ * 래치하지 않고, 먼저 재초기화(WHOAMI+SMUX 재구성, i2c_recover_bus 포함, m_i2c_as7341.c
+ * m_i2c_as7341_init() 참고)로 자체 복구를 시도한다. 재초기화가 성공하면 이번 tick 샘플만
+ * 유실 처리하고 다음 tick부터 정상 복귀 — 연속 실패가 I2C_FAULT_RECOVERY_MAX_ATTEMPTS회
+ * 누적됐을 때만 진짜 하드웨어 고장으로 판단해 CTRL_STATE_DEGRADED로 에스컬레이션한다
+ * (단일고장 안전상태 원칙은 유지하되, 복구 가능한 일시적 fault까지 영구 정지시키지는
+ * 않는 것이 이번 항목의 목적, config_app.h I2C_FAULT_RECOVERY_MAX_ATTEMPTS 참고).
+ */
+static void recover_as7341_or_escalate(int sensor_idx, module_err_t err)
+{
+	module_err_t reinit_err =
+		m_i2c_as7341_init(&s_as7341[sensor_idx], s_as7341[sensor_idx].i2c_dev);
+
+	if (reinit_err == MODULE_ERR_OK) {
+		/* init()은 gain/integration time을 모르므로(내부적으로 재설정 안 함) 현재
+		 * 설정값을 다시 적용해야 다음 tick부터 정상 측정된다. */
+		m_i2c_as7341_set_gain(&s_as7341[sensor_idx], s_fixed_gain);
+		m_i2c_as7341_set_integration_time(&s_as7341[sensor_idx],
+						   (uint8_t)s_fixed_integration_time);
+		LOG_WRN("AS7341(%d) I2C fault 복구 성공(재초기화, 직전 streak=%u)", sensor_idx,
+			s_i2c_fault_streak[sensor_idx]);
+		s_i2c_fault_streak[sensor_idx] = 0;
+		return;
+	}
+
+	s_i2c_fault_streak[sensor_idx]++;
+	LOG_ERR("AS7341(%d) I2C fault 복구 실패 (streak=%u/%u)", sensor_idx,
+		s_i2c_fault_streak[sensor_idx], I2C_FAULT_RECOVERY_MAX_ATTEMPTS);
+
+	if (s_i2c_fault_streak[sensor_idx] >= I2C_FAULT_RECOVERY_MAX_ATTEMPTS) {
+		m_ctrl_report_error(err);
+	}
+}
+
+/* dark=true면 LED를 전부 끈 채로(주변광+dark current만) 측정한다 — gain/ATIME/ASTEP은
+ * lit과 절대 바꾸지 않는다(같은 조건이어야 앱이 lit_raw-dark_raw로 스케일링 없이 뺄 수
+ * 있음, AS7341은 곱연산이 아니라 적분시간에 선형 비례하는 누적연산이기 때문 — 사용자
+ * 논의, 2026-09-28). sanity check(포화/저신호)는 다크 프레임에는 적용하지 않는다 —
+ * 다크는 원래 low signal이 정상이라 매번 오탐될 것이기 때문.
+ */
+static void acquire_common(nirs_sample_t *sample, bool dark)
 {
 	sample->timestamp_us = m_i2c_rtc_get_timestamp_us();
 	sample->seq_num = s_seq_num++;
@@ -279,36 +327,56 @@ static void acquire_one_sample(nirs_sample_t *sample)
 	sample->battery_pct = 0; /* TODO(open-item): Battery 모듈 미구현 */
 	sample->fw_version = FW_VERSION_PACKED;
 	sample->status = MODULE_ERR_OK;
+	sample->is_dark = dark;
 
 	for (int wl = 0; wl < NIRS_WAVELENGTH_COUNT; wl++) {
-		/* BLE AS7341_CONFIG로 설정된 duty 사용 (기본값 500‰) — apply_pending_ble_config() 참고. */
-		sample->led_duty[wl] = s_led_duty_permille[wl];
-		m_i2c_led_set_duty((nirs_wavelength_t)wl, sample->led_duty[wl]);
+		if (dark) {
+			sample->led_duty[wl] = 0;
+		} else {
+			/* BLE AS7341_CONFIG로 설정된 duty 사용 (기본값 500‰) — apply_pending_ble_config() 참고. */
+			sample->led_duty[wl] = s_led_duty_permille[wl];
+			m_i2c_led_set_duty((nirs_wavelength_t)wl, sample->led_duty[wl]);
+		}
 	}
 
 	/* NIR1/NIR2를 먼저 둘 다 트리거해서 적분이 동시에 진행되게 한 뒤, 그 다음에
 	 * 순서대로 읽는다 — 트리거→읽기를 센서별로 번갈아 하면 적분 대기시간이 순차로
 	 * 더해져 의도한 측정 주기(Cycle)보다 느려짐(v0.1.23, m_i2c_as7341.h 주석 참고). */
+	bool triggered_ok[NIR_SENSOR_COUNT] = {false};
+
 	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
 		module_err_t err = m_i2c_as7341_trigger_measurement(&s_as7341[i]);
 
 		if (err != MODULE_ERR_OK) {
 			sample->status = err;
-			m_ctrl_report_error(err);
+			recover_as7341_or_escalate(i, err);
+		} else {
+			triggered_ok[i] = true;
 		}
 	}
 
+	bool hw_saturated[NIR_SENSOR_COUNT] = {false};
+
 	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
-		module_err_t err = m_i2c_as7341_read_raw(&s_as7341[i], sample->raw[i]);
+		if (!triggered_ok[i]) {
+			/* 이번 tick 트리거부터 실패한 센서는 읽기도 스킵 — 같은 tick에 recovery를
+			 * 두 번 시도하지 않는다(위 트리거 루프에서 이미 처리됨). */
+			continue;
+		}
+
+		module_err_t err = m_i2c_as7341_read_raw(&s_as7341[i], sample->raw[i],
+							  &hw_saturated[i]);
 
 		if (err != MODULE_ERR_OK) {
 			sample->status = err;
-			m_ctrl_report_error(err);
+			recover_as7341_or_escalate(i, err);
+		} else {
+			s_i2c_fault_streak[i] = 0;
 		}
 	}
 
-	if (sample->status == MODULE_ERR_OK) {
-		module_err_t sanity_err = check_sensor_sanity(sample);
+	if (!dark && sample->status == MODULE_ERR_OK) {
+		module_err_t sanity_err = check_sensor_sanity(sample, hw_saturated);
 
 		if (sanity_err != MODULE_ERR_OK) {
 			sample->status = sanity_err;
@@ -318,7 +386,20 @@ static void acquire_one_sample(nirs_sample_t *sample)
 		}
 	}
 
-	m_i2c_led_all_off();
+	if (!dark) {
+		m_i2c_led_all_off();
+	}
+}
+
+static void acquire_one_sample(nirs_sample_t *sample)
+{
+	acquire_common(sample, false);
+}
+
+/* lit 측정 직후(LED가 이미 꺼진 상태) 호출된다 — 별도로 LED를 끌 필요가 없다. */
+static void acquire_one_dark_sample(nirs_sample_t *sample)
+{
+	acquire_common(sample, true);
 }
 
 /* RTC 100ms tick마다 1회 호출. 시나리오 1(LED 1개씩 1초 순차 점등)을 진행하다가,
@@ -334,9 +415,6 @@ static void handle_device_on_tick(void)
 		return;
 	}
 
-#if TEMP_LED_STATIC_ALL_ON_TEST
-	return; /* TEMP(하드웨어 진단): 순차 점등 로직을 건너뛰고 3개 전부 계속 켜둔다 */
-#endif
 
 	s_device_on_tick_count++;
 	if (s_device_on_tick_count < I2C_LED_DEVICE_ON_STEP_TICKS) {
@@ -458,13 +536,6 @@ void m_i2c_task_entry(void *p1, void *p2, void *p3)
 
 		apply_pending_ble_config();
 
-#if TEMP_RTC_TICK_LOG_TEST
-		/* TEMP(개발용): RTC ISR이 준 세마포어로 깨어난 시점의 타임스탬프를 찍어
-		 * tick 간격이 실제로 ~100ms인지 확인 (ISR 자체는 로그 금지이므로 소비
-		 * 측 태스크에서 확인 — codingstandard.md §3). */
-		LOG_INF("RTC tick, timestamp_us=%u", m_i2c_rtc_get_timestamp_us());
-#endif
-
 #if TEMP_WATCHDOG_FAULT_INJECT_TEST
 		{
 			static uint32_t s_fault_inject_tick_count;
@@ -535,6 +606,26 @@ void m_i2c_task_entry(void *p1, void *p2, void *p3)
 						"검증용 가시화, 2026-09-18)",
 						m_i2c_ring_buffer_get_dropped_count());
 					m_ctrl_report_error(err);
+				}
+
+				/* Ambient light 제거(2026-09-28) — lit DARK_FRAME_LIT_INTERVAL개마다
+				 * 다크 프레임 1개를 추가로 push한다. LED는 위 acquire_one_sample()
+				 * 끝에서 이미 꺼졌으므로 별도 조치 없이 바로 측정 가능. */
+				s_dark_frame_tick_counter++;
+				if (s_dark_frame_tick_counter >= DARK_FRAME_LIT_INTERVAL) {
+					s_dark_frame_tick_counter = 0;
+
+					nirs_sample_t dark_sample;
+
+					acquire_one_dark_sample(&dark_sample);
+
+					module_err_t dark_err = m_i2c_ring_buffer_push(&dark_sample);
+
+					if (dark_err == MODULE_ERR_RING_BUFFER_OVERFLOW) {
+						LOG_WRN("Ring buffer overflow(dark), dropped_count=%u",
+							m_i2c_ring_buffer_get_dropped_count());
+						m_ctrl_report_error(dark_err);
+					}
 				}
 			} else {
 				m_i2c_led_all_off();
