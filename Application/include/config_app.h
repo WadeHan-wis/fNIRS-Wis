@@ -20,7 +20,7 @@ extern "C" {
  */
 #define FW_VERSION_MAJOR 0
 #define FW_VERSION_MINOR 1
-#define FW_VERSION_PATCH 31
+#define FW_VERSION_PATCH 36
 
 /* nirs_sample_t.fw_version(uint16_t)에 담기 위한 패킹: MAJOR(4bit)|MINOR(4bit)|PATCH(8bit) */
 #define FW_VERSION_PACKED \
@@ -159,11 +159,28 @@ typedef enum {
  * I2C 트리거/읽기 실패(MODULE_ERR_I2C_TIMEOUT) 시 하드웨어 watchdog(위)이 SoC 전체를
  * 리셋할 때까지 기다리지 않고, 먼저 AS7341 재초기화(WHOAMI+SMUX 재구성, i2c_recover_bus
  * 포함 — m_i2c_as7341_init() 참고)로 자체 복구를 시도한다. 연속 실패가 이 횟수에
- * 도달해야만 진짜 하드웨어 고장으로 판단해 CTRL_STATE_DEGRADED(단일고장 안전상태,
- * 재부팅 전까지 래치)로 에스컬레이션한다 — 일시적 I2C 글리치까지 영구 정지시키지
- * 않기 위함(m_i2c.c recover_as7341_or_escalate() 참고).
+ * 도달해야만 진짜 하드웨어 고장으로 판단해 `m_ctrl_report_error()`로 에스컬레이션한다
+ * (그 뒤 처리는 아래 CTRL_MODULE_FAULT_REBOOT_MAX 참고) — 일시적 I2C 글리치까지 곧장
+ * 정지시키지 않기 위함(m_i2c.c recover_as7341_or_escalate() 참고).
  */
 #define I2C_FAULT_RECOVERY_MAX_ATTEMPTS 3
+
+/* --- 모듈 오류 재부팅 에스컬레이션 (2026-09-29, TedreamS2 재시도 로직 참고 적용) ---
+ * `m_ctrl_report_error()`로 보고된 오류가 기존에는(v0.1.31까지) 확인 즉시
+ * CTRL_STATE_DEGRADED로 영구 래치(재부팅해야만 해제)됐는데, 사용자 결정에 따라
+ * TedreamS2 재시도 로직을 우리 구조에 맞게 변형해 적용한다: 이 횟수만큼은 먼저
+ * 소프트웨어 재부팅(`m_ctrl_request_reset()`)으로 복구를 시도해보고, 그래도 같은
+ * 계열의 오류가 재발하면 그때 비로소 영구 안전상태로 전환한다(`m_ctrl.c
+ * escalate_or_reboot()` 참고). 재부팅 횟수는 GPREGRET(POR 전에는 지워지지 않는
+ * 레지스터)에 저장 — 즉 "물리적으로 전원을 껐다 켜야만" 카운트가 초기화된다
+ * (TedreamS2의 "재부팅 3회도 실패하면 전원 off" 4단계를, 우리 보드는 SW로 전원을
+ * 끌 수 없어(물리 SW1뿐) "더 이상 재부팅하지 않는 영구 정지"로 대체한 것).
+ * **주의**: 이 카운트는 부팅 세션 내내 누적되며 성공적으로 복구돼도 리셋되지
+ * 않는다(TedreamS2 원 로직 그대로) — 서로 무관한 오류 3번이 쌓여도 마지막엔 영구
+ * 정지된다. 의료기기 단일고장 안전 철학(IEC 60601)과의 정합성은 아직 정식
+ * 검토되지 않은 상태 — TODO(open-item, architecture.md §11 규제 항목과 연결).
+ */
+#define CTRL_MODULE_FAULT_REBOOT_MAX 3
 
 /* TEMP(watchdog 실기 fault injection 테스트용, 2026-09-17): 1이면 m_i2c 태스크가
  * 부팅 후 TEMP_WATCHDOG_FAULT_INJECT_TICKS번째 tick에서 완전히 멈춘다(m_ctrl_notify_alive
@@ -203,15 +220,21 @@ typedef enum {
  */
 #define AS7341_LOW_SIGNAL_THRESHOLD 10
 
-/* --- Ambient light 제거(dark-frame subtraction, 2026-09-28) ---
+/* --- Ambient light 제거(dark-frame subtraction, 2026-09-28, 비율 2026-09-29 조정) ---
  * lit(정상 측정) 샘플 DARK_FRAME_LIT_INTERVAL개마다 다크 프레임(LED 전부 OFF, 같은
  * gain/ATIME/ASTEP)을 1개 추가로 삽입한다. 다크(주변광+dark current)는 생리신호(맥동)보다
- * 훨씬 느리게 변하므로 lit과 1:1로 잴 필요가 없다 — 10:1 비율이면 데이터량/전력 증가를
- * 약 +10%로 제한하면서도 오프셋 추적에는 충분하다(사용자 결정, 2026-09-28).
+ * 훨씬 느리게 변하므로 lit과 1:1로 잴 필요가 없다는 원칙은 그대로 유지.
+ * [2026-09-29] 원래 10:1이었는데, dark 기준점의 최신성(정밀도)을 조금 더 높이기 위해
+ * 3:1로 변경 — 절충안(사용자 결정). 주의: dark 프레임은 별도 tick이 아니라 해당 활성
+ * tick 안에서 lit 측정 직후 추가로 한 번 더 트리거+적분하는 방식(m_i2c.c acquire_common()
+ * 호출부 참고)이라, 이 값을 낮출수록 AS7341/I2C 활성 듀티가 유의미하게 늘어난다(10:1일 때
+ * 평균 활성 듀티 약 36% → 3:1일 때 약 43%, 1:1이면 약 66%까지 증가 — 실측 없이 추정한
+ * 구조적 계산이며 실측 검증 필요). BLE 전송량도 그만큼 늘어나므로 §6 전력 최적화
+ * 항목(TX power/batch flush interval)과 함께 검토해서 정함 — 2026-09-29 대화 참고.
  * lit 샘플레이트/ring buffer 용량(RING_BUFFER_CAPACITY, 위 §2.5)에는 영향 없음 — 정적
- * 배열 크기가 아니라 실제 push 빈도만 소폭(+10%) 늘어나는 것이라 기존 용량 여유로 흡수된다.
+ * 배열 크기가 아니라 실제 push 빈도만 늘어나는 것이라 기존 용량 여유로 흡수된다.
  */
-#define DARK_FRAME_LIT_INTERVAL 10
+#define DARK_FRAME_LIT_INTERVAL 3
 
 #ifdef __cplusplus
 }

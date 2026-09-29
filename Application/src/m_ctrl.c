@@ -3,6 +3,7 @@
 #include <zephyr/sys/reboot.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/drivers/hwinfo.h>
+#include <zephyr/drivers/retained_mem.h>
 #include <zephyr/logging/log.h>
 #include "m_ctrl.h"
 #include "config_app.h"
@@ -107,6 +108,39 @@ static const struct device *s_wdt_dev = DEVICE_DT_GET(DT_ALIAS(watchdog0));
 static int s_wdt_channel_id = -1;
 static volatile uint32_t s_last_alive_ms[CTRL_ALIVE_SOURCE_COUNT];
 
+/* 모듈 오류 재부팅 에스컬레이션(2026-09-29, config_app.h CTRL_MODULE_FAULT_REBOOT_MAX
+ * 참고) — 재부팅 횟수를 GPREGRET(POR 전에는 지워지지 않음)에 저장한다. gpregret1은
+ * nRF52832 devicetree에 이미 status="okay"로 정의돼 있어 별도 overlay 불필요
+ * (prj.conf CONFIG_RETAINED_MEM=y만 추가). */
+static const struct device *s_gpregret_dev = DEVICE_DT_GET(DT_NODELABEL(gpregret1));
+
+/* GPREGRET 1바이트를 재부팅 횟수 카운터로 사용 — read/write 실패(디바이스 not-ready 등)
+ * 시에는 보수적으로 "이미 상한에 도달한 것"으로 간주해 곧장 영구 안전상태로 보낸다
+ * (카운터를 못 믿는 상태에서 재부팅을 계속 반복하는 것보다 안전). */
+static uint8_t read_fault_reboot_count(void)
+{
+	uint8_t count = CTRL_MODULE_FAULT_REBOOT_MAX;
+
+	if (!device_is_ready(s_gpregret_dev)) {
+		return count;
+	}
+
+	if (retained_mem_read(s_gpregret_dev, 0, &count, sizeof(count)) != 0) {
+		return CTRL_MODULE_FAULT_REBOOT_MAX;
+	}
+
+	return count;
+}
+
+static void write_fault_reboot_count(uint8_t count)
+{
+	if (!device_is_ready(s_gpregret_dev)) {
+		return;
+	}
+
+	(void)retained_mem_write(s_gpregret_dev, 0, &count, sizeof(count));
+}
+
 void m_ctrl_notify_alive(ctrl_alive_source_t src)
 {
 	if (src < CTRL_ALIVE_SOURCE_COUNT) {
@@ -143,6 +177,15 @@ static void log_reset_cause(void)
 	}
 
 	(void)hwinfo_clear_reset_cause();
+
+	/* [2026-09-29] 모듈 오류 재부팅 에스컬레이션(escalate_or_reboot()) 진단용 —
+	 * 이 카운트는 물리 전원 재투입 전까지 리셋 사이 계속 유지된다(GPREGRET). */
+	uint8_t fault_reboot_count = read_fault_reboot_count();
+
+	if (fault_reboot_count > 0) {
+		LOG_WRN("모듈 오류 재부팅 카운트: %u/%u (물리 전원 재투입 전까지 유지)",
+			fault_reboot_count, CTRL_MODULE_FAULT_REBOOT_MAX);
+	}
 }
 
 static void watchdog_init(void)
@@ -207,6 +250,31 @@ static void feed_watchdog_if_alive(void)
 	wdt_feed(s_wdt_dev, s_wdt_channel_id);
 }
 
+/* 모듈 오류 재부팅 에스컬레이션(2026-09-29, config_app.h CTRL_MODULE_FAULT_REBOOT_MAX
+ * 상단 주석 참고, TedreamS2 재시도 로직을 우리 구조에 맞게 변형 적용) — 예전에는(v0.1.31
+ * 까지) 이 함수로 들어오는 오류가 확인 즉시 CTRL_STATE_DEGRADED로 영구 래치됐는데,
+ * 이제는 GPREGRET에 저장된 재부팅 횟수가 상한(CTRL_MODULE_FAULT_REBOOT_MAX) 미만이면
+ * 먼저 소프트웨어 재부팅으로 복구를 시도하고, 상한에 도달했을 때만 영구 안전상태로
+ * 전환한다. GPREGRET는 POR(물리 전원 재투입) 전에는 지워지지 않으므로, 재부팅을
+ * 반복해도 카운트가 유지된다 — "사용자가 물리적으로 전원을 껐다 켜야만" 다시 3번의
+ * 재시도 기회가 생긴다. */
+static void escalate_or_reboot(module_err_t err)
+{
+	uint8_t reboot_count = read_fault_reboot_count();
+
+	if (reboot_count < CTRL_MODULE_FAULT_REBOOT_MAX) {
+		write_fault_reboot_count(reboot_count + 1);
+		LOG_ERR("모듈 오류(err=%d) 감지 — 재부팅으로 복구 시도 (%u/%u)", err,
+			reboot_count + 1, CTRL_MODULE_FAULT_REBOOT_MAX);
+		m_ctrl_request_reset(CTRL_RESET_REASON_FAULT); /* 이후로는 복귀하지 않음 */
+		return;
+	}
+
+	LOG_ERR("모듈 오류(err=%d) — 재부팅 %u회 모두 실패, 영구 안전상태로 전환 "
+		"(물리 전원 재투입 전까지 유지)", err, CTRL_MODULE_FAULT_REBOOT_MAX);
+	g_ctrl_status = CTRL_STATE_DEGRADED;
+}
+
 static void handle_error(module_err_t err)
 {
 	switch (err) {
@@ -226,7 +294,7 @@ static void handle_error(module_err_t err)
 	case MODULE_ERR_I2C_NACK:
 	case MODULE_ERR_BLE_TX_FAILED:
 	case MODULE_ERR_BLE_RETRY_EXCEEDED:
-		g_ctrl_status = CTRL_STATE_DEGRADED;
+		escalate_or_reboot(err);
 		break;
 
 	case MODULE_ERR_WATCHDOG_TRIGGERED:
@@ -234,7 +302,7 @@ static void handle_error(module_err_t err)
 		break;
 
 	default:
-		g_ctrl_status = CTRL_STATE_DEGRADED;
+		escalate_or_reboot(err);
 		break;
 	}
 }

@@ -4,6 +4,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
 #include <stdbool.h>
+#include <string.h>
 #include "m_i2c.h"
 #include "m_ble.h"
 #include "m_i2c_rtc.h"
@@ -29,6 +30,18 @@ static uint16_t s_dark_frame_tick_counter;
 
 /* NIR1(&i2c1)/NIR2(&i2c0) — pinmap.md §3, 각각 독립 I2C 버스에 실장된 AS7341 2개. */
 static m_i2c_as7341_dev_t s_as7341[NIR_SENSOR_COUNT];
+
+/* [버그 수정, 2026-09-29] 부팅 시 센서별 초기화 성공 여부 — 하나라도 실패하면 true인
+ * 센서로만 계속 진행한다(둘 다 실패해야 진짜 치명적). 실기로 확인된 문제: 기존에는
+ * i2c_init()이 두 센서 중 하나라도 init 실패하면 즉시 포기하고 m_i2c_task_entry()가
+ * k_sleep(K_FOREVER)로 잠들어버려, watchdog이 4초마다 SoC를 리셋하는 게 무한 반복됐다
+ * (R3/R4 풀업 제거로 NIR1 WHOAMI 실패 재현, RTT 로그로 확인). 이제는 실패한 센서만
+ * 배제하고 나머지 센서로 계속 측정 — Acquisition/BLE 독립성·"센서 하나 죽어도 계속
+ * 측정"이라는 런타임 fault recovery(recover_as7341_or_escalate())와 동일한 철학을
+ * 부팅 시점에도 적용한다. TODO(open-item): 배제된 센서를 런타임 중 주기적으로
+ * 재프로브하는 로직은 아직 없음(재부팅해야 복구 시도) — 필요해지면 추가.
+ */
+static bool s_as7341_ready[NIR_SENSOR_COUNT];
 
 /*
  * LED 상태 시나리오 (요청사항 그대로):
@@ -67,10 +80,13 @@ static uint32_t s_standby_blink_tick_count;
 static uint8_t s_device_on_led_index;
 static uint8_t s_device_on_tick_count;
 
-/* BLE AS7341_CONFIG로 설정 가능한 파장별 LED duty (permille). 기본값은 기존
- * placeholder(500‰=50%)를 유지 — CONFIG write가 들어오면 apply_pending_ble_config()가
- * 갱신한다 (2026-09-15, 테스트 APK 프로토콜 반영). */
-static uint16_t s_led_duty_permille[NIRS_WAVELENGTH_COUNT] = {500, 500, 500};
+/* BLE AS7341_CONFIG로 설정 가능한 파장별 LED duty (permille). 기본값은 "매뉴얼 조합"
+ * 250/500/750‰(=25/50/75%, 640/680/950nm) — 2026-09-28 3박 실측 비교 끝에 고정
+ * 운용값으로 확정된 것과 동일(architecture.md §11 항목5 7차 결정). 앱이 CONFIG를
+ * 한 번도 안 보내도 확정값 그대로 측정되게 하기 위해 2026-09-29 기존 placeholder
+ * (500‰=50/50/50%)에서 변경 — CONFIG write가 들어오면 apply_pending_ble_config()가
+ * 그대로 덮어쓴다. */
+static uint16_t s_led_duty_permille[NIRS_WAVELENGTH_COUNT] = {250, 500, 750};
 
 /* cycle/active window(offset 6-9) 게이팅 — architecture.md §11 항목4(BLE 실 스택+APK
  * 연동) 완료를 위해 2026-09-18 추가. RTC 100ms tick 주기 자체는 그대로 유지하고
@@ -166,14 +182,30 @@ static module_err_t i2c_init(void)
 		return err;
 	}
 
-	err = m_i2c_as7341_init(&s_as7341[NIR_SENSOR_1], DEVICE_DT_GET(DT_NODELABEL(i2c1)));
-	if (err != MODULE_ERR_OK) {
-		return err;
+	/* [버그 수정, 2026-09-29] 두 센서를 서로 독립적으로 시도 — 한쪽이 실패해도 즉시
+	 * return하지 않는다(위 s_as7341_ready 주석 참고). 둘 다 실패했을 때만 진짜 치명적. */
+	const struct device *as7341_bus[NIR_SENSOR_COUNT] = {
+		DEVICE_DT_GET(DT_NODELABEL(i2c1)),
+		DEVICE_DT_GET(DT_NODELABEL(i2c0)),
+	};
+	int ready_count = 0;
+
+	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
+		module_err_t sensor_err = m_i2c_as7341_init(&s_as7341[i], as7341_bus[i]);
+
+		s_as7341_ready[i] = (sensor_err == MODULE_ERR_OK);
+		if (s_as7341_ready[i]) {
+			ready_count++;
+		} else {
+			LOG_ERR("AS7341(%d) 부팅 초기화 실패 — 이 센서는 배제하고 계속 진행 (err=%d)",
+				i, sensor_err);
+		}
 	}
 
-	err = m_i2c_as7341_init(&s_as7341[NIR_SENSOR_2], DEVICE_DT_GET(DT_NODELABEL(i2c0)));
-	if (err != MODULE_ERR_OK) {
-		return err;
+	if (ready_count == 0) {
+		/* 두 센서 다 실패 — 측정할 게 아무것도 없으므로 여기서만 기존처럼 전체 포기.
+		 * (m_i2c_task_entry()가 error 보고 후 k_sleep(K_FOREVER)로 넘어감) */
+		return MODULE_ERR_NOT_INITIALIZED;
 	}
 
 	/* [버그 수정, 2026-09-21] I2C bus stuck 재시도(m_i2c_as7341_init() 최대 3회)가 걸리면
@@ -195,6 +227,9 @@ static module_err_t i2c_init(void)
 	s_fixed_gain = 9;
 	s_fixed_integration_time = 1;
 	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
+		if (!s_as7341_ready[i]) {
+			continue;
+		}
 		m_i2c_as7341_set_gain(&s_as7341[i], s_fixed_gain);
 		m_i2c_as7341_set_integration_time(&s_as7341[i], (uint8_t)s_fixed_integration_time);
 	}
@@ -345,6 +380,13 @@ static void acquire_common(nirs_sample_t *sample, bool dark)
 	bool triggered_ok[NIR_SENSOR_COUNT] = {false};
 
 	for (int i = 0; i < NIR_SENSOR_COUNT; i++) {
+		if (!s_as7341_ready[i]) {
+			/* [버그 수정, 2026-09-29] 부팅 시 초기화 실패로 배제된 센서 — 재시도
+			 * 없이(재부팅 전까지 계속 배제, TODO(open-item) 참고) raw는 0으로 둔다. */
+			memset(sample->raw[i], 0, sizeof(sample->raw[i]));
+			continue;
+		}
+
 		module_err_t err = m_i2c_as7341_trigger_measurement(&s_as7341[i]);
 
 		if (err != MODULE_ERR_OK) {
