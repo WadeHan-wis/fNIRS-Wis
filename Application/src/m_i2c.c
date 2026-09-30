@@ -668,6 +668,51 @@ void m_i2c_task_entry(void *p1, void *p2, void *p3)
 							m_i2c_ring_buffer_get_dropped_count());
 						m_ctrl_report_error(dark_err);
 					}
+
+					/* [버그 수정, 2026-09-30] dark는 lit과 같은 tick 안에서 추가로
+					 * 트리거+적분되는 구조라(위 주석 참고), 그 다음 lit이 원래
+					 * cycle_ms(예: 300ms) 뒤가 아니라 (lit 적분시간+dark 적분시간+
+					 * 자연 대기)만큼 뒤에 트리거돼 lit-lit 간격이 늘어남을 실측으로
+					 * 확인(2026-09-30, lit-lit 300ms 유지 구간 중 dark가 낀 구간만
+					 * 400ms로 벌어짐). dark 자신의 타임스탬프 정밀도는 보정용이라
+					 * 중요하지 않고 lit들의 간격이 항상 cycle_ms로 일정한 게
+					 * 중요하다는 게 확정 요구사항(사용자 결정) — 여기서 다음 lit을
+					 * 기존 tick 대기 없이 곧바로, 정확히 보정된 시간만큼만 재운 뒤
+					 * 직접 수행해서 lit3(이번 tick) 시작 시각 기준 정확히 cycle_ms
+					 * 뒤에 오도록 강제한다. */
+					uint32_t integration_ms = (uint32_t)s_fixed_integration_time * 20U;
+					uint32_t tick_ms = 1000U / SAMPLE_RATE_HZ;
+					uint32_t cycle_ms = (uint32_t)s_gate_cycle_ticks * tick_ms;
+					uint32_t lit_and_dark_ms = 2U * integration_ms; /* lit 자신 + dark, 둘 다
+										           * 같은 적분시간 사용 */
+
+					if (lit_and_dark_ms < cycle_ms) {
+						k_sleep(K_MSEC(cycle_ms - lit_and_dark_ms));
+					}
+
+					nirs_sample_t next_lit_sample;
+
+					acquire_one_sample(&next_lit_sample);
+
+					module_err_t next_err = m_i2c_ring_buffer_push(&next_lit_sample);
+
+					if (next_err == MODULE_ERR_RING_BUFFER_OVERFLOW) {
+						LOG_WRN("Ring buffer overflow, dropped_count=%u",
+							m_i2c_ring_buffer_get_dropped_count());
+						m_ctrl_report_error(next_err);
+					}
+					s_dark_frame_tick_counter++;
+
+					/* 이번 tick 안에서 (lit+dark+보정대기+다음 lit)까지 실제로는
+					 * cycle_ticks만큼의 시간이 통째로 더 지나갔다 — 아래 공통
+					 * trailing s_gate_tick_count++(이 tick 자신의 1회분)와 합쳐
+					 * 총 (cycle_ticks+1)회분만큼 카운터를 전진시켜서, 다음
+					 * is_gate_active_tick() 판정이 실제 경과 시간과 어긋나지 않게
+					 * 한다. 일부러 세마포어를 비우지 않는다 — 그 사이 쌓인 신호
+					 * 1개(binary라 최대 1개)는 바로 다음 tick(비활성)이 알아서
+					 * 빠르게 소비해 자연스럽게 맞아떨어짐(2026-09-30 시뮬레이션
+					 * 검증, 실기 검증 필요). */
+					s_gate_tick_count += s_gate_cycle_ticks;
 				}
 			} else {
 				m_i2c_led_all_off();
